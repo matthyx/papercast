@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Pipeline manages the GStreamer capture child process.
@@ -54,9 +55,10 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 		log.Printf("[capture] Trying encoder: %s", encName)
 
 		pipelineStr := fmt.Sprintf(
-			"pipewiresrc fd=3 path=%d do-timestamp=true keepalive-time=1000 ! "+
+			"pipewiresrc fd=3 path=%d always-copy=true do-timestamp=true keepalive-time=1000 ! "+
+				"videorate drop-only=true max-rate=%d ! "+
 				"videoconvert ! "+
-				"video/x-raw,format=NV12,framerate=%d/1 ! "+
+				"video/x-raw,format=NV12 ! "+
 				"%s ! "+
 				"video/x-h264,profile=constrained-baseline ! "+
 				"h264parse config-interval=-1 ! "+
@@ -85,6 +87,23 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 			lastErr = err
 			log.Printf("[capture] Failed to start pipeline with %s: %v", encName, err)
 			continue
+		}
+
+		// Verify pipeline survives preroll before declaring success
+		exitChan := make(chan error, 1)
+		go func() {
+			exitChan <- cmd.Wait()
+		}()
+
+		select {
+		case exitErr := <-exitChan:
+			cancel()
+			stderrMsg := strings.TrimSpace(stderr.String())
+			lastErr = fmt.Errorf("%s failed to preroll: %v (stderr: %s)", encName, exitErr, stderrMsg)
+			log.Printf("[capture] %s failed to preroll: %s", encName, stderrMsg)
+			continue
+		case <-time.After(400 * time.Millisecond):
+			// Pipeline successfully prerolled and is streaming
 		}
 
 		p.cmd = cmd
@@ -117,7 +136,6 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 				}
 			}
 
-			_ = cmd.Wait()
 			if stderr.Len() > 0 {
 				log.Printf("[capture] GStreamer output: %s", strings.TrimSpace(stderr.String()))
 			}
