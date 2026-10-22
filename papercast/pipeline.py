@@ -29,8 +29,7 @@ class ScreenCapturePipeline:
         encoders = [
             # 1. Intel VA-API hardware encoder (CQP mode for zero latency)
             (
-                "video/x-raw,format=NV12 "
-                f"! vaapih264enc rate-control=cqp init-qp=24 max-bframes=0 keyframe-period={self.fps} "
+                f"vaapih264enc rate-control=cqp init-qp=24 max-bframes=0 keyframe-period={self.fps} "
                 "! video/x-h264,profile=constrained-baseline"
             ),
             # 2. Software fallback
@@ -42,9 +41,9 @@ class ScreenCapturePipeline:
 
         for enc in encoders:
             pipeline_desc = (
-                f"pipewiresrc fd={self.fd} target-object={self.node_id} do-timestamp=true keepalive-time=1000 ! "
+                f"pipewiresrc fd={self.fd} path={self.node_id} do-timestamp=true keepalive-time=1000 ! "
                 f"videoconvert ! "
-                f"video/x-raw,framerate={self.fps}/1 ! "
+                f"video/x-raw,format=NV12,framerate={self.fps}/1 ! "
                 f"{enc} ! "
                 f"h264parse config-interval=-1 ! "
                 f"video/x-h264,stream-format=byte-stream,alignment=au ! "
@@ -80,12 +79,29 @@ class ScreenCapturePipeline:
         if success:
             try:
                 data = bytes(map_info.data)
+                if not hasattr(self, "_frame_count"):
+                    self._frame_count = 0
+                self._frame_count += 1
+                if self._frame_count == 1:
+                    logger.info("First video frame encoded and received from appsink (%d bytes)", len(data))
                 if self.on_frame_callback:
                     self.on_frame_callback(data)
             finally:
                 buf.unmap(map_info)
 
         return Gst.FlowReturn.OK
+
+    def _bus_monitor(self):
+        if not self.pipeline:
+            return
+        bus = self.pipeline.get_bus()
+        while self.is_running and self.pipeline:
+            msg = bus.timed_pop_filtered(500 * Gst.MSECOND, Gst.MessageType.ERROR | Gst.MessageType.EOS)
+            if msg:
+                if msg.type == Gst.MessageType.ERROR:
+                    err, debug = msg.parse_error()
+                    logger.error("GStreamer bus error from %s: %s (debug: %s)", msg.src.get_name(), err, debug)
+                break
 
     def start(self):
         if not self.pipeline:
@@ -96,6 +112,8 @@ class ScreenCapturePipeline:
         if ret == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("GStreamer pipeline failed to enter PLAYING state.")
         self.is_running = True
+        self._frame_count = 0
+        threading.Thread(target=self._bus_monitor, daemon=True).start()
 
     def stop(self):
         if self.pipeline:
