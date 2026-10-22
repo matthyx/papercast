@@ -20,27 +20,31 @@ class PapercastServer:
         self.bitrate_kbps = bitrate_kbps
         self.portal = None
         self.pipeline = None
-        self.clients = set()
+        self.client_queues = {}  # websocket -> asyncio.Queue
         self.loop = None
         self.static_dir = os.path.join(os.path.dirname(__file__), "static")
+        self._capture_lock = asyncio.Lock()
 
     def _on_frame(self, data: bytes):
-        if not self.clients or not self.loop:
+        if not self.client_queues or not self.loop:
             return
 
-        # Schedule async broadcast on event loop
         self.loop.call_soon_threadsafe(self._broadcast_frame, data)
 
     def _broadcast_frame(self, data: bytes):
-        for ws in list(self.clients):
-            if ws.open:
-                asyncio.create_task(self._send_frame_safe(ws, data))
-
-    async def _send_frame_safe(self, ws, data: bytes):
-        try:
-            await ws.send(data)
-        except Exception:
-            self.clients.discard(ws)
+        for ws, q in list(self.client_queues.items()):
+            if not ws.open:
+                continue
+            # Drop older frame if client is slow to keep latency minimal
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                q.put_nowait(data)
+            except asyncio.QueueFull:
+                pass
 
     def start_capture(self):
         if self.pipeline and self.pipeline.is_running:
@@ -97,17 +101,32 @@ class PapercastServer:
 
         return (HTTPStatus.NOT_FOUND, [("Content-Type", "text/plain")], b"404 Not Found")
 
-    async def _ws_handler(self, websocket, path):
+    async def _ws_handler(self, websocket, path=None):
         logger.info("Client connected to stream: %s", websocket.remote_address)
-        self.clients.add(websocket)
+        queue = asyncio.Queue(maxsize=1)
+        self.client_queues[websocket] = queue
 
-        # Start capturing when first client connects
-        if len(self.clients) == 1:
+        # Ensure capture pipeline is running
+        async with self._capture_lock:
+            if not self.pipeline or not self.pipeline.is_running:
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, self.start_capture)
+                except Exception as e:
+                    logger.error("Failed to start screen capture: %s", e)
+                    await websocket.send(f'{{"error": "{str(e)}"}}')
+
+        async def sender():
             try:
-                self.start_capture()
-            except Exception as e:
-                logger.error("Failed to start screen capture: %s", e)
-                await websocket.send(f'{{"error": "{str(e)}"}}')
+                while websocket.open:
+                    data = await queue.get()
+                    await websocket.send(data)
+            except asyncio.CancelledError:
+                pass
+            except Exception as err:
+                logger.debug("Sender ended for %s: %s", websocket.remote_address, err)
+
+        sender_task = asyncio.create_task(sender())
 
         try:
             async for message in websocket:
@@ -116,13 +135,11 @@ class PapercastServer:
         except Exception as e:
             logger.debug("Client connection ended: %s", e)
         finally:
-            self.clients.discard(websocket)
-            logger.info("Client disconnected. Active clients: %d", len(self.clients))
-            if not self.clients:
-                logger.info("All clients disconnected. Stopping capture pipeline...")
-                self.stop_capture()
+            sender_task.cancel()
+            self.client_queues.pop(websocket, None)
+            logger.info("Client disconnected: %s. Active clients: %d", websocket.remote_address, len(self.client_queues))
 
-    async def run(self):
+    async def run(self, auto_capture=True):
         self.loop = asyncio.get_running_loop()
         logger.info("Starting Papercast server on http://%s:%d...", self.host, self.port)
         async with websockets.serve(
@@ -132,4 +149,16 @@ class PapercastServer:
             process_request=self._process_http_request,
             max_size=10 * 1024 * 1024,
         ):
+            if auto_capture:
+                asyncio.create_task(self._auto_start_capture())
             await asyncio.Future()  # run forever
+
+    async def _auto_start_capture(self):
+        try:
+            logger.info("Requesting screen capture permission from desktop...")
+            async with self._capture_lock:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self.start_capture)
+            logger.info("==> Desktop streaming ready! Open http://127.0.0.1:%d on your HannsNote2 tablet.", self.port)
+        except Exception as e:
+            logger.warning("Auto capture prompt cancelled or failed (will retry on client connect): %s", e)

@@ -27,19 +27,27 @@ class ScreenCapturePipeline:
     def build_pipeline(self):
         # Try VA-API hardware encoder first, then x264enc fallback
         encoders = [
-            # Intel VA-API
-            f"vaapih264enc rate-control=cbr tune=zerolatency bitrate={self.bitrate_kbps} keyframe-period={self.fps}",
-            # Software fallback
-            f"x264enc tune=zerolatency speed-preset=ultrafast bitrate={self.bitrate_kbps} key-int-max={self.fps}",
+            # 1. Intel VA-API hardware encoder (CQP mode for zero latency)
+            (
+                "video/x-raw,format=NV12 "
+                f"! vaapih264enc rate-control=cqp init-qp=24 max-bframes=0 keyframe-period={self.fps} "
+                "! video/x-h264,profile=constrained-baseline"
+            ),
+            # 2. Software fallback
+            (
+                f"x264enc tune=zerolatency speed-preset=ultrafast bitrate={self.bitrate_kbps} key-int-max={self.fps} "
+                "! video/x-h264,profile=constrained-baseline"
+            ),
         ]
 
         for enc in encoders:
             pipeline_desc = (
-                f"pipewiresrc fd={self.fd} path={self.node_id} do-timestamp=true keepalive-time=1000 ! "
+                f"pipewiresrc fd={self.fd} target-object={self.node_id} do-timestamp=true keepalive-time=1000 ! "
                 f"videoconvert ! "
                 f"video/x-raw,framerate={self.fps}/1 ! "
                 f"{enc} ! "
-                f"h264parse config-interval=-1 stream-format=byte-stream ! "
+                f"h264parse config-interval=-1 ! "
+                f"video/x-h264,stream-format=byte-stream,alignment=au ! "
                 f"appsink name=sink emit-signals=true drop=true max-buffers=1 sync=false"
             )
             logger.info("Trying pipeline: %s", pipeline_desc)

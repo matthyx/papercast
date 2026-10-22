@@ -145,5 +145,5 @@ class ScreenCastPortal:
                 session_iface.Close()
                 logger.info("Portal session closed.")
             except Exception as e:
-                logger.debug("Error closing portal session: %e", e)
+                logger.debug("Error closing portal session: %s", e)
             self.session_path = None
