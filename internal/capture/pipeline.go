@@ -74,8 +74,8 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 				}
 				p.mu.Unlock()
 
-				log.Printf("[capture] Stream interrupted (fullscreen/resolution/portal reset). Reviving pipeline in 150ms...")
-				time.Sleep(150 * time.Millisecond)
+				log.Printf("[capture] Stream interrupted (fullscreen/resolution/portal reset). Reviving pipeline in 50ms...")
+				time.Sleep(50 * time.Millisecond)
 
 				p.mu.Lock()
 				if !p.stopped {
@@ -139,11 +139,13 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 			// - always-copy=true: releases PipeWire compositor buffer immediately, preventing buffer starvation in cosmic-comp
 			// - min-buffers=1 max-buffers=2: enforces strict double-buffering so cosmic-comp never receives concurrent create_frame requests
 			// - do-timestamp=true: assign stream timestamps to buffers
+			// - queue max-size-buffers=3 leaky=downstream: cushions PipeWire thread against Direct Scanout jitter and format renegotiation stalls
 			// - videoconvert: standardizes any compositor buffer format into NV12 directly from pipewiresrc
 			// - videorate drop-only=true skip-to-first=true: cleanly caps framerate at p.fps without frame duplication
 			// - queue leaky=downstream: decouples capture from hardware encoding
 			pipelineStr = fmt.Sprintf(
 				"pipewiresrc fd=3 path=%d always-copy=true min-buffers=1 max-buffers=2 do-timestamp=true ! "+
+					"queue max-size-buffers=3 leaky=downstream ! "+
 					"videoconvert ! "+
 					"video/x-raw,format=NV12 ! "+
 					"videorate drop-only=true skip-to-first=true max-rate=%d ! "+
