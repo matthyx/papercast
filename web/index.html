@@ -190,12 +190,17 @@
 
             decoder = new VideoDecoder({
                 output: (frame) => {
-                    if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-                        canvas.width = frame.displayWidth;
-                        canvas.height = frame.displayHeight;
+                    try {
+                        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+                            canvas.width = frame.displayWidth;
+                            canvas.height = frame.displayHeight;
+                        }
+                        ctx.drawImage(frame, 0, 0);
+                    } catch (drawErr) {
+                        console.warn("Draw frame error:", drawErr);
+                    } finally {
+                        frame.close();
                     }
-                    ctx.drawImage(frame, 0, 0);
-                    frame.close();
 
                     frameCount++;
                     let now = performance.now();
@@ -211,8 +216,8 @@
                 },
                 error: (e) => {
                     console.error("VideoDecoder error:", e);
-                    statusEl.textContent = "Decoder error: " + (e.message || e);
-                    statusEl.classList.remove("hide");
+                    hasReceivedKeyframe = false;
+                    setTimeout(initDecoder, 300);
                 }
             });
 
@@ -287,6 +292,10 @@
                 }
 
                 if (decoder && decoder.state === "configured") {
+                    if (decoder.decodeQueueSize > 5 && !isKey) {
+                        // Drop delta frames if tablet hardware decoder is temporarily overloaded
+                        return;
+                    }
                     try {
                         const chunk = new EncodedVideoChunk({
                             type: isKey ? "key" : "delta",
@@ -296,6 +305,7 @@
                         decoder.decode(chunk);
                     } catch (err) {
                         console.warn("Decode chunk error:", err);
+                        hasReceivedKeyframe = false;
                     }
                 }
             };

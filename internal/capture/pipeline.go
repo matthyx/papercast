@@ -19,6 +19,7 @@ type Pipeline struct {
 	nodeID      uint32
 	fps         int
 	bitrateKbps int
+	qp          int
 
 	cmd    *exec.Cmd
 	cancel context.CancelFunc
@@ -26,12 +27,16 @@ type Pipeline struct {
 	done   chan struct{}
 }
 
-func NewPipeline(pwFile *os.File, nodeID uint32, fps int, bitrateKbps int) *Pipeline {
+func NewPipeline(pwFile *os.File, nodeID uint32, fps int, bitrateKbps int, qp int) *Pipeline {
+	if qp <= 0 {
+		qp = 26
+	}
 	return &Pipeline{
 		pwFile:      pwFile,
 		nodeID:      nodeID,
 		fps:         fps,
 		bitrateKbps: bitrateKbps,
+		qp:          qp,
 		done:        make(chan struct{}),
 	}
 }
@@ -41,30 +46,48 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Available encoders in order of preference:
-	// 1. Intel VA-API zero-latency CQP hardware encoder
-	// 2. x264enc ultrafast software encoder
-	encoders := []string{
-		fmt.Sprintf("vaapih264enc rate-control=cqp init-qp=24 max-bframes=0 keyframe-period=%d", p.fps),
-		fmt.Sprintf("x264enc tune=zerolatency speed-preset=ultrafast bitrate=%d key-int-max=%d", p.bitrateKbps, p.fps),
+	type encTier struct {
+		name     string
+		filter   string
+		encoder  string
+	}
+
+	encoders := []encTier{
+		// 1. Full GPU pipeline: VA-API GPU color conversion + VA-API hardware encode (lowest CPU)
+		{
+			name:    "vaapi (full GPU)",
+			filter:  "vaapipostproc",
+			encoder: fmt.Sprintf("vaapih264enc rate-control=cqp init-qp=%d max-bframes=0 keyframe-period=%d", p.qp, p.fps),
+		},
+		// 2. Hybrid: CPU videoconvert + VA-API hardware encode
+		{
+			name:    "vaapi (CPU convert)",
+			filter:  "videoconvert ! video/x-raw,format=NV12",
+			encoder: fmt.Sprintf("vaapih264enc rate-control=cqp init-qp=%d max-bframes=0 keyframe-period=%d", p.qp, p.fps),
+		},
+		// 3. Pure software fallback
+		{
+			name:    "x264enc (software)",
+			filter:  "videoconvert ! video/x-raw,format=NV12",
+			encoder: fmt.Sprintf("x264enc tune=zerolatency speed-preset=ultrafast bitrate=%d key-int-max=%d", p.bitrateKbps, p.fps),
+		},
 	}
 
 	var lastErr error
-	for _, enc := range encoders {
-		encName := strings.Fields(enc)[0]
-		log.Printf("[capture] Trying encoder: %s", encName)
+	for _, tier := range encoders {
+		log.Printf("[capture] Trying encoder: %s", tier.name)
 
 		pipelineStr := fmt.Sprintf(
 			"pipewiresrc fd=3 path=%d always-copy=true do-timestamp=true keepalive-time=1000 ! "+
+				"queue max-size-buffers=2 leaky=downstream ! "+
 				"videorate drop-only=true max-rate=%d ! "+
-				"videoconvert ! "+
-				"video/x-raw,format=NV12 ! "+
+				"%s ! "+
 				"%s ! "+
 				"video/x-h264,profile=constrained-baseline ! "+
 				"h264parse config-interval=-1 ! "+
 				"video/x-h264,stream-format=byte-stream,alignment=au ! "+
 				"fdsink fd=1 sync=false",
-			p.nodeID, p.fps, enc,
+			p.nodeID, p.fps, tier.filter, tier.encoder,
 		)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -85,7 +108,7 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 		if err != nil {
 			cancel()
 			lastErr = err
-			log.Printf("[capture] Failed to start pipeline with %s: %v", encName, err)
+			log.Printf("[capture] Failed to start pipeline with %s: %v", tier.name, err)
 			continue
 		}
 
@@ -99,8 +122,8 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 		case exitErr := <-exitChan:
 			cancel()
 			stderrMsg := strings.TrimSpace(stderr.String())
-			lastErr = fmt.Errorf("%s failed to preroll: %v (stderr: %s)", encName, exitErr, stderrMsg)
-			log.Printf("[capture] %s failed to preroll: %s", encName, stderrMsg)
+			lastErr = fmt.Errorf("%s failed to preroll: %v (stderr: %s)", tier.name, exitErr, stderrMsg)
+			log.Printf("[capture] %s failed to preroll: %s", tier.name, stderrMsg)
 			continue
 		case <-time.After(400 * time.Millisecond):
 			// Pipeline successfully prerolled and is streaming
@@ -139,9 +162,9 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 			if stderr.Len() > 0 {
 				log.Printf("[capture] GStreamer output: %s", strings.TrimSpace(stderr.String()))
 			}
-		}(encName)
+		}(tier.name)
 
-		log.Printf("[capture] Capture pipeline running with %s", encName)
+		log.Printf("[capture] Capture pipeline running with %s", tier.name)
 		return nil
 	}
 

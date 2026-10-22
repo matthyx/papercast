@@ -25,6 +25,7 @@ func main() {
 	port := flag.Int("port", 1701, "Port to serve on")
 	fps := flag.Int("fps", 30, "Target capture framerate")
 	bitrate := flag.Int("bitrate", 3000, "Encoding bitrate in kbps")
+	qp := flag.Int("qp", 26, "VA-API Quantization Parameter (lower = higher quality, higher = lower bitrate, default 26)")
 	cursorMode := flag.Uint("cursor", uint(portal.CursorModeEmbedded), "Cursor mode (1: hidden, 2: embedded)")
 	autoOpen := flag.Bool("open", false, "Automatically open Chrome on connected Android tablet")
 	showVersion := flag.Bool("version", false, "Print Papercast version")
@@ -60,7 +61,7 @@ func main() {
 	defer session.Close()
 
 	// 4. Start GStreamer capture & encoding pipeline
-	pipeline := capture.NewPipeline(session.PWFile, session.NodeID, *fps, *bitrate)
+	pipeline := capture.NewPipeline(session.PWFile, session.NodeID, *fps, *bitrate, *qp)
 	err = pipeline.Start(func(frame []byte, isKey bool) {
 		srv.BroadcastFrame(frame, isKey)
 	})

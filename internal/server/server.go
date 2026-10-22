@@ -20,8 +20,9 @@ var upgrader = websocket.Upgrader{
 }
 
 type client struct {
-	ws *websocket.Conn
-	ch chan []byte
+	ws          *websocket.Conn
+	ch          chan []byte
+	droppingGOP bool
 }
 
 type Server struct {
@@ -79,17 +80,34 @@ func (s *Server) BroadcastFrame(frame []byte, isKey bool) {
 	}
 
 	for c := range s.clients {
+		if c.droppingGOP {
+			if !isKey {
+				// Continue dropping delta frames until a fresh keyframe arrives
+				continue
+			}
+			// Keyframe arrived! Safely resume streaming without missing references
+			c.droppingGOP = false
+		}
+
 		select {
 		case c.ch <- frame:
 		default:
-			// Non-blocking: drop stale frame so HannsNote2 tablet always receives real-time stream
-			select {
-			case <-c.ch:
-			default:
-			}
-			select {
-			case c.ch <- frame:
-			default:
+			// Buffer full (30 frames waiting in transit). Enter GOP-dropping mode:
+			// Drop this and following delta frames until the next keyframe arrives.
+			c.droppingGOP = true
+			if isKey {
+				// If this frame is a keyframe, drain queue and send it
+				for len(c.ch) > 0 {
+					select {
+					case <-c.ch:
+					default:
+					}
+				}
+				select {
+				case c.ch <- frame:
+					c.droppingGOP = false
+				default:
+				}
 			}
 		}
 	}
@@ -110,7 +128,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	c := &client{
 		ws: ws,
-		ch: make(chan []byte, 1), // Single-frame buffer: zero latency
+		ch: make(chan []byte, 30), // 30-frame buffer (absorbs YouTube spikes with zero drops)
 	}
 
 	s.mu.Lock()
