@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>Papercast</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+        }
+        body, html {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+        #container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        canvas {
+            display: block;
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+        /* High-contrast outdoor mode for E-ink/RLCD */
+        .high-contrast {
+            filter: contrast(135%) brightness(105%);
+        }
+        .grayscale {
+            filter: grayscale(100%) contrast(140%);
+        }
+
+        /* Controls overlay */
+        #hud {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            display: flex;
+            gap: 8px;
+            opacity: 0.2;
+            transition: opacity 0.2s ease;
+            z-index: 100;
+        }
+        #hud:hover, #hud:active {
+            opacity: 1;
+        }
+        .btn {
+            background: rgba(30, 30, 30, 0.85);
+            color: #fff;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            padding: 8px 14px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            backdrop-filter: blur(8px);
+        }
+        .btn:active {
+            background: rgba(80, 80, 80, 0.9);
+        }
+
+        #stats {
+            position: absolute;
+            bottom: 12px;
+            left: 12px;
+            background: rgba(0, 0, 0, 0.6);
+            color: #4ade80;
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-family: monospace;
+            pointer-events: none;
+            z-index: 100;
+        }
+
+        #status-msg {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #cbd5e1;
+            font-size: 16px;
+            text-align: center;
+            background: rgba(15, 23, 42, 0.85);
+            padding: 16px 24px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            pointer-events: none;
+        }
+        .hide {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <canvas id="view"></canvas>
+        <div id="hud">
+            <button class="btn" id="btn-contrast">Contrast</button>
+            <button class="btn" id="btn-fs">Fullscreen</button>
+        </div>
+        <div id="stats">FPS: 0 | Latency: ~10ms</div>
+        <div id="status-msg">Connecting to Papercast...</div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById("view");
+        const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+        const statsEl = document.getElementById("stats");
+        const statusEl = document.getElementById("status-msg");
+        const btnFs = document.getElementById("btn-fs");
+        const btnContrast = document.getElementById("btn-contrast");
+
+        let decoder = null;
+        let ws = null;
+        let frameCount = 0;
+        let lastFpsTime = performance.now();
+        let fps = 0;
+        let contrastModes = ["normal", "high-contrast", "grayscale"];
+        let currentContrast = 0;
+
+        btnContrast.onclick = (e) => {
+            e.stopPropagation();
+            canvas.classList.remove(contrastModes[currentContrast]);
+            currentContrast = (currentContrast + 1) % contrastModes.length;
+            if (contrastModes[currentContrast] !== "normal") {
+                canvas.classList.add(contrastModes[currentContrast]);
+            }
+            btnContrast.textContent = contrastModes[currentContrast];
+        };
+
+        btnFs.onclick = (e) => {
+            e.stopPropagation();
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen({ navigationUI: "hide" }).catch(() => {});
+            } else {
+                document.exitFullscreen().catch(() => {});
+            }
+        };
+
+        function isKeyframe(data) {
+            // Scan for NAL units in Annex B
+            for (let i = 0; i < data.length - 4; i++) {
+                if (data[i] === 0 && data[i+1] === 0 && (data[i+2] === 1 || (data[i+2] === 0 && data[i+3] === 1))) {
+                    let nalOffset = (data[i+2] === 1) ? i + 3 : i + 4;
+                    let nalType = data[nalOffset] & 0x1f;
+                    // 5 = IDR (Keyframe), 7 = SPS
+                    if (nalType === 5 || nalType === 7) return true;
+                }
+            }
+            return false;
+        }
+
+        function initDecoder() {
+            if (!('VideoDecoder' in window)) {
+                statusEl.textContent = "Error: WebCodecs VideoDecoder API not supported in this browser.";
+                return false;
+            }
+
+            decoder = new VideoDecoder({
+                output: (frame) => {
+                    if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+                        canvas.width = frame.displayWidth;
+                        canvas.height = frame.displayHeight;
+                    }
+                    ctx.drawImage(frame, 0, 0);
+                    frame.close();
+
+                    frameCount++;
+                    let now = performance.now();
+                    if (now - lastFpsTime >= 1000) {
+                        fps = Math.round((frameCount * 1000) / (now - lastFpsTime));
+                        statsEl.textContent = `FPS: ${fps} | WebCodecs Hardware`;
+                        frameCount = 0;
+                        lastFpsTime = now;
+                    }
+                    if (!statusEl.classList.contains("hide")) {
+                        statusEl.classList.add("hide");
+                    }
+                },
+                error: (e) => {
+                    console.error("VideoDecoder error:", e);
+                }
+            });
+
+            decoder.configure({
+                codec: "avc1.420028", // H.264 Baseline Level 4.0
+                optimizeForLatency: true,
+                hardwareAcceleration: "prefer-hardware"
+            });
+
+            return true;
+        }
+
+        function connect() {
+            if (!initDecoder()) return;
+
+            const proto = window.location.protocol === "https:" ? "wss://" : "ws://";
+            const wsUrl = proto + window.location.host + "/ws";
+            statusEl.textContent = "Connecting to " + wsUrl + "...";
+            statusEl.classList.remove("hide");
+
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = "arraybuffer";
+
+            ws.onopen = () => {
+                statusEl.textContent = "Waiting for desktop frames...";
+            };
+
+            ws.onmessage = (event) => {
+                if (typeof event.data === "string") {
+                    return;
+                }
+
+                const u8 = new Uint8Array(event.data);
+                const isKey = isKeyframe(u8);
+
+                try {
+                    const chunk = new EncodedVideoChunk({
+                        type: isKey ? "key" : "delta",
+                        timestamp: performance.now() * 1000,
+                        data: u8
+                    });
+                    decoder.decode(chunk);
+                } catch (err) {
+                    console.warn("Decode chunk error:", err);
+                }
+            };
+
+            ws.onclose = () => {
+                statusEl.textContent = "Disconnected from server. Reconnecting in 2s...";
+                statusEl.classList.remove("hide");
+                setTimeout(connect, 2000);
+            };
+
+            ws.onerror = (err) => {
+                console.error("WebSocket error:", err);
+            };
+        }
+
+        window.onload = connect;
+    </script>
+</body>
+</html>
