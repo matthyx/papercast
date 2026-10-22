@@ -49,6 +49,19 @@ func (s *Session) OpenPipeWireRemote() (*os.File, error) {
 	return os.NewFile(uintptr(fd), "pipewire"), nil
 }
 
+// IsAlive checks if the session D-Bus connection is still valid.
+func (s *Session) IsAlive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.conn == nil || s.SessionHandle == "" {
+		return false
+	}
+	dbusObj := s.conn.Object("org.freedesktop.DBus", "/org/freedesktop/DBus")
+	var hasOwner bool
+	err := dbusObj.Call("org.freedesktop.DBus.NameHasOwner", 0, "org.freedesktop.portal.Desktop").Store(&hasOwner)
+	return err == nil && hasOwner
+}
+
 func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

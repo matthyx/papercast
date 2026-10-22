@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -56,17 +57,47 @@ func main() {
 	var pipeline *capture.Pipeline
 	if *testMode {
 		log.Printf("[capture] Running in autonomous test mode with SMPTE test pattern")
-		pipeline = capture.NewPipeline(nil, 0, *fps, *bitrate, *qp)
+		pipeline = capture.NewPipeline(nil, *fps, *bitrate, *qp)
 	} else {
-		// 3. Request desktop screen share authorization via xdg-desktop-portal (or restore token)
-		log.Printf("[portal] Requesting ScreenCast permission from desktop...")
-		session, err := portal.RequestScreenCast(uint32(*cursorMode), 60*time.Second)
-		if err != nil {
-			log.Fatalf("[portal] Portal error: %v", err)
-		}
-		defer session.Close()
+		var (
+			currentSession *portal.Session
+			sessMu         sync.Mutex
+		)
 
-		pipeline = capture.NewPipeline(session.OpenPipeWireRemote, session.NodeID, *fps, *bitrate, *qp)
+		sessionProvider := func() (*os.File, uint32, error) {
+			sessMu.Lock()
+			defer sessMu.Unlock()
+
+			// Close old session if any, ensuring previous stream node is cleaned up
+			if currentSession != nil {
+				_ = currentSession.Close()
+				currentSession = nil
+			}
+
+			// Acquire live ScreenCast session via restore token (instant, headless, no prompt)
+			log.Printf("[portal] Acquiring fresh ScreenCast session via restore token...")
+			sess, err := portal.RequestScreenCast(uint32(*cursorMode), 10*time.Second)
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to acquire portal session: %w", err)
+			}
+			currentSession = sess
+
+			pwFile, err := sess.OpenPipeWireRemote()
+			if err != nil {
+				return nil, 0, err
+			}
+			return pwFile, sess.NodeID, nil
+		}
+
+		defer func() {
+			sessMu.Lock()
+			if currentSession != nil {
+				_ = currentSession.Close()
+			}
+			sessMu.Unlock()
+		}()
+
+		pipeline = capture.NewPipeline(sessionProvider, *fps, *bitrate, *qp)
 	}
 
 	// 4. Start GStreamer capture & encoding pipeline

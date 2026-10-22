@@ -13,13 +13,16 @@ import (
 	"time"
 )
 
+// SessionProvider provides a live PipeWire remote file and node ID.
+// If the session died (e.g. portal crash), it re-acquires a valid session seamlessly.
+type SessionProvider func() (*os.File, uint32, error)
+
 // Pipeline manages the GStreamer capture child process.
 type Pipeline struct {
-	openPW      func() (*os.File, error)
-	nodeID      uint32
-	fps         int
-	bitrateKbps int
-	qp          int
+	sessionProvider SessionProvider
+	fps             int
+	bitrateKbps     int
+	qp              int
 
 	cmd         *exec.Cmd
 	cancel      context.CancelFunc
@@ -30,19 +33,18 @@ type Pipeline struct {
 	done        chan struct{}
 }
 
-func NewPipeline(openPW func() (*os.File, error), nodeID uint32, fps int, bitrateKbps int, qp int) *Pipeline {
+func NewPipeline(sessionProvider SessionProvider, fps int, bitrateKbps int, qp int) *Pipeline {
 	if qp <= 0 {
 		qp = 26
 	}
 	return &Pipeline{
-		openPW:      openPW,
-		nodeID:      nodeID,
-		fps:         fps,
-		bitrateKbps: bitrateKbps,
-		qp:          qp,
-		processDone: make(chan struct{}, 1),
-		quit:        make(chan struct{}),
-		done:        make(chan struct{}),
+		sessionProvider: sessionProvider,
+		fps:             fps,
+		bitrateKbps:     bitrateKbps,
+		qp:              qp,
+		processDone:     make(chan struct{}, 1),
+		quit:            make(chan struct{}),
+		done:            make(chan struct{}),
 	}
 }
 
@@ -72,14 +74,14 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 				}
 				p.mu.Unlock()
 
-				log.Printf("[capture] Stream interrupted (fullscreen/resolution change). Reviving pipeline in 200ms...")
-				time.Sleep(200 * time.Millisecond)
+				log.Printf("[capture] Stream interrupted (fullscreen/resolution/portal reset). Reviving pipeline in 150ms...")
+				time.Sleep(150 * time.Millisecond)
 
 				p.mu.Lock()
 				if !p.stopped {
 					if rErr := p.launchOnce(onFrame); rErr != nil {
-						log.Printf("[capture] Revive failed: %v, will retry in 1s...", rErr)
-						time.Sleep(1 * time.Second)
+						log.Printf("[capture] Revive failed: %v, will retry in 500ms...", rErr)
+						time.Sleep(500 * time.Millisecond)
 						select {
 						case p.processDone <- struct{}{}:
 						default:
@@ -121,25 +123,27 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 			pipelineStr string
 			extraFiles  []*os.File
 			pwFile      *os.File
+			nodeID      uint32
 		)
 
-		if p.openPW != nil {
-			// Request a fresh PipeWire remote FD for this GStreamer process
+		if p.sessionProvider != nil {
+			// Request a fresh PipeWire remote FD and live node ID
 			var err error
-			pwFile, err = p.openPW()
+			pwFile, nodeID, err = p.sessionProvider()
 			if err != nil {
-				return fmt.Errorf("failed to obtain PipeWire remote fd: %w", err)
+				return fmt.Errorf("failed to obtain PipeWire remote connection: %w", err)
 			}
 			extraFiles = []*os.File{pwFile}
 
 			// Stable PipeWire screen capture pipeline:
 			// - always-copy=true: releases PipeWire compositor buffer immediately, preventing buffer starvation in cosmic-comp
+			// - min-buffers=1 max-buffers=2: enforces strict double-buffering so cosmic-comp never receives concurrent create_frame requests
 			// - do-timestamp=true: assign stream timestamps to buffers
 			// - videorate drop-only=true skip-to-first=true: cleanly caps framerate at p.fps without frame duplication
 			// - videoconvert: standardizes any compositor buffer format into NV12
 			// - queue leaky=downstream: decouples capture from hardware encoding
 			pipelineStr = fmt.Sprintf(
-				"pipewiresrc fd=3 path=%d always-copy=true do-timestamp=true ! "+
+				"pipewiresrc fd=3 path=%d always-copy=true min-buffers=1 max-buffers=2 do-timestamp=true ! "+
 					"videorate drop-only=true skip-to-first=true max-rate=%d ! "+
 					"videoconvert ! "+
 					"video/x-raw,format=NV12 ! "+
@@ -149,7 +153,7 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 					"h264parse config-interval=-1 ! "+
 					"video/x-h264,stream-format=byte-stream,alignment=au ! "+
 					"fdsink fd=1 sync=false",
-				p.nodeID, p.fps, tier.encoder,
+				nodeID, p.fps, tier.encoder,
 			)
 		} else {
 			// Autonomous synthetic test pattern pipeline (no desktop capture / portal needed)
