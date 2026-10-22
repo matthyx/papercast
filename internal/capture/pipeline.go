@@ -117,38 +117,66 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 	for _, tier := range encoders {
 		log.Printf("[capture] Trying encoder: %s", tier.name)
 
-		// Request a fresh PipeWire remote FD for this GStreamer process
-		pwFile, err := p.openPW()
-		if err != nil {
-			return fmt.Errorf("failed to obtain PipeWire remote fd: %w", err)
-		}
-
-		// Stable PipeWire screen capture pipeline:
-		// - do-timestamp=true: assign stream timestamps to buffers
-		// - videorate drop-only=true skip-to-first=true: cleanly caps framerate at p.fps without frame duplication
-		// - videoconvert: standardizes any compositor buffer format into NV12
-		// - queue leaky=downstream: decouples capture from hardware encoding
-		pipelineStr := fmt.Sprintf(
-			"pipewiresrc fd=3 path=%d do-timestamp=true ! "+
-				"videorate drop-only=true skip-to-first=true max-rate=%d ! "+
-				"videoconvert ! "+
-				"video/x-raw,format=NV12 ! "+
-				"queue max-size-buffers=2 leaky=downstream ! "+
-				"%s ! "+
-				"video/x-h264,profile=constrained-baseline ! "+
-				"h264parse config-interval=-1 ! "+
-				"video/x-h264,stream-format=byte-stream,alignment=au ! "+
-				"fdsink fd=1 sync=false",
-			p.nodeID, p.fps, tier.encoder,
+		var (
+			pipelineStr string
+			extraFiles  []*os.File
+			pwFile      *os.File
 		)
+
+		if p.openPW != nil {
+			// Request a fresh PipeWire remote FD for this GStreamer process
+			var err error
+			pwFile, err = p.openPW()
+			if err != nil {
+				return fmt.Errorf("failed to obtain PipeWire remote fd: %w", err)
+			}
+			extraFiles = []*os.File{pwFile}
+
+			// Stable PipeWire screen capture pipeline:
+			// - always-copy=true: releases PipeWire compositor buffer immediately, preventing buffer starvation in cosmic-comp
+			// - do-timestamp=true: assign stream timestamps to buffers
+			// - videorate drop-only=true skip-to-first=true: cleanly caps framerate at p.fps without frame duplication
+			// - videoconvert: standardizes any compositor buffer format into NV12
+			// - queue leaky=downstream: decouples capture from hardware encoding
+			pipelineStr = fmt.Sprintf(
+				"pipewiresrc fd=3 path=%d always-copy=true do-timestamp=true ! "+
+					"videorate drop-only=true skip-to-first=true max-rate=%d ! "+
+					"videoconvert ! "+
+					"video/x-raw,format=NV12 ! "+
+					"queue max-size-buffers=2 leaky=downstream ! "+
+					"%s ! "+
+					"video/x-h264,profile=constrained-baseline ! "+
+					"h264parse config-interval=-1 ! "+
+					"video/x-h264,stream-format=byte-stream,alignment=au ! "+
+					"fdsink fd=1 sync=false",
+				p.nodeID, p.fps, tier.encoder,
+			)
+		} else {
+			// Autonomous synthetic test pattern pipeline (no desktop capture / portal needed)
+			pipelineStr = fmt.Sprintf(
+				"videotestsrc is-live=true pattern=smpte ! "+
+					"video/x-raw,framerate=%d/1,width=1920,height=1080 ! "+
+					"videoconvert ! "+
+					"video/x-raw,format=NV12 ! "+
+					"queue max-size-buffers=2 leaky=downstream ! "+
+					"%s ! "+
+					"video/x-h264,profile=constrained-baseline ! "+
+					"h264parse config-interval=-1 ! "+
+					"video/x-h264,stream-format=byte-stream,alignment=au ! "+
+					"fdsink fd=1 sync=false",
+				p.fps, tier.encoder,
+			)
+		}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cmd := exec.CommandContext(ctx, "gst-launch-1.0", strings.Fields(pipelineStr)...)
-		cmd.ExtraFiles = []*os.File{pwFile}
+		cmd.ExtraFiles = extraFiles
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			_ = pwFile.Close()
+			if pwFile != nil {
+				_ = pwFile.Close()
+			}
 			cancel()
 			lastErr = err
 			continue
@@ -158,9 +186,9 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 		cmd.Stderr = &stderr
 
 		err = cmd.Start()
-		// In Go, cmd.ExtraFiles are duplicated into the child during Start().
-		// Closing the parent's file descriptor immediately prevents leaks while child retains fd 3.
-		_ = pwFile.Close()
+		if pwFile != nil {
+			_ = pwFile.Close()
+		}
 
 		if err != nil {
 			cancel()

@@ -28,6 +28,7 @@ func main() {
 	qp := flag.Int("qp", 26, "VA-API Quantization Parameter (lower = higher quality, higher = lower bitrate, default 26)")
 	cursorMode := flag.Uint("cursor", uint(portal.CursorModeEmbedded), "Cursor mode (1: hidden, 2: embedded)")
 	autoOpen := flag.Bool("open", false, "Automatically open Chrome on connected Android tablet")
+	testMode := flag.Bool("test", false, "Run in test mode with synthetic video pattern (no desktop screen authorization needed)")
 	showVersion := flag.Bool("version", false, "Print Papercast version")
 	flag.Parse()
 
@@ -52,17 +53,24 @@ func main() {
 		}
 	}()
 
-	// 3. Request desktop screen share authorization via xdg-desktop-portal
-	log.Printf("[portal] Requesting ScreenCast permission from desktop...")
-	session, err := portal.RequestScreenCast(uint32(*cursorMode), 60*time.Second)
-	if err != nil {
-		log.Fatalf("[portal] Portal error: %v", err)
+	var pipeline *capture.Pipeline
+	if *testMode {
+		log.Printf("[capture] Running in autonomous test mode with SMPTE test pattern")
+		pipeline = capture.NewPipeline(nil, 0, *fps, *bitrate, *qp)
+	} else {
+		// 3. Request desktop screen share authorization via xdg-desktop-portal (or restore token)
+		log.Printf("[portal] Requesting ScreenCast permission from desktop...")
+		session, err := portal.RequestScreenCast(uint32(*cursorMode), 60*time.Second)
+		if err != nil {
+			log.Fatalf("[portal] Portal error: %v", err)
+		}
+		defer session.Close()
+
+		pipeline = capture.NewPipeline(session.OpenPipeWireRemote, session.NodeID, *fps, *bitrate, *qp)
 	}
-	defer session.Close()
 
 	// 4. Start GStreamer capture & encoding pipeline
-	pipeline := capture.NewPipeline(session.OpenPipeWireRemote, session.NodeID, *fps, *bitrate, *qp)
-	err = pipeline.Start(func(frame []byte, isKey bool) {
+	err := pipeline.Start(func(frame []byte, isKey bool) {
 		srv.BroadcastFrame(frame, isKey)
 	})
 	if err != nil {

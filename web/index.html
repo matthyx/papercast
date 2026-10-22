@@ -292,8 +292,10 @@
                 }
 
                 if (decoder && decoder.state === "configured") {
-                    if (decoder.decodeQueueSize > 5 && !isKey) {
-                        // Drop delta frames if tablet hardware decoder is temporarily overloaded
+                    if (decoder.decodeQueueSize > 8 && !isKey) {
+                        // Hardware decoder backlog: drop remaining GOP until next keyframe
+                        // to prevent missing reference frame freezes.
+                        hasReceivedKeyframe = false;
                         return;
                     }
                     try {

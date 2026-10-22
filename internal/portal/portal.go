@@ -5,6 +5,8 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -68,6 +70,35 @@ func (s *Session) Close() error {
 		_ = s.conn.Close()
 	}
 	return nil
+}
+
+func getRestoreTokenPath() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(configDir, "papercast", "restore_token")
+}
+
+func loadRestoreToken() string {
+	p := getRestoreTokenPath()
+	if p == "" {
+		return ""
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func saveRestoreToken(token string) {
+	p := getRestoreTokenPath()
+	if p == "" || token == "" {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(p), 0755)
+	_ = os.WriteFile(p, []byte(token), 0600)
 }
 
 // RequestScreenCast performs the D-Bus handshake with xdg-desktop-portal.
@@ -145,12 +176,21 @@ func RequestScreenCast(cursorMode uint32, timeout time.Duration) (*Session, erro
 	// 2. SelectSources
 	token2 := fmt.Sprintf("t_%d", r.Intn(900000)+100000)
 	var selectReqPath dbus.ObjectPath
-	err = portal.Call("org.freedesktop.portal.ScreenCast.SelectSources", 0, sessionHandle, map[string]dbus.Variant{
+	restoreToken := loadRestoreToken()
+
+	selectOpts := map[string]dbus.Variant{
 		"handle_token": dbus.MakeVariant(token2),
 		"types":        dbus.MakeVariant(uint32(1)), // Monitor
 		"multiple":     dbus.MakeVariant(false),
 		"cursor_mode":  dbus.MakeVariant(cursorMode),
-	}).Store(&selectReqPath)
+		"persist_mode": dbus.MakeVariant(uint32(2)), // Persist until explicitly revoked
+	}
+	if restoreToken != "" {
+		selectOpts["restore_token"] = dbus.MakeVariant(restoreToken)
+		log.Printf("[portal] Attempting headless screen share with saved restore token...")
+	}
+
+	err = portal.Call("org.freedesktop.portal.ScreenCast.SelectSources", 0, sessionHandle, selectOpts).Store(&selectReqPath)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("SelectSources call failed: %w", err)
@@ -177,15 +217,32 @@ func RequestScreenCast(cursorMode uint32, timeout time.Duration) (*Session, erro
 		return nil, fmt.Errorf("Start call failed: %w", err)
 	}
 
-	log.Printf("[portal] Prompting desktop for screen share authorization...")
+	if restoreToken == "" {
+		log.Printf("[portal] Prompting desktop for screen share authorization...")
+	} else {
+		log.Printf("[portal] Restoring screen share session (no prompt needed)...")
+	}
+
 	resp, startRes, err := waitForResponse(startReqPath)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 	if resp != 0 {
+		if restoreToken != "" {
+			log.Printf("[portal] Saved restore token expired or invalid, clearing...")
+			_ = os.Remove(getRestoreTokenPath())
+		}
 		conn.Close()
 		return nil, fmt.Errorf("ScreenCast authorization denied by user (code %d)", resp)
+	}
+
+	// Save new restore token if issued by compositor
+	if tokenVal, ok := startRes["restore_token"]; ok {
+		if tokenStr, ok := tokenVal.Value().(string); ok && tokenStr != "" {
+			saveRestoreToken(tokenStr)
+			log.Printf("[portal] Successfully saved restore token (headless capture ready for next time)")
+		}
 	}
 
 	// Parse stream node ID
