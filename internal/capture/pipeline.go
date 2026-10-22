@@ -21,10 +21,11 @@ type Pipeline struct {
 	bitrateKbps int
 	qp          int
 
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
-	mu     sync.Mutex
-	done   chan struct{}
+	cmd     *exec.Cmd
+	cancel  context.CancelFunc
+	mu      sync.Mutex
+	stopped bool
+	done    chan struct{}
 }
 
 func NewPipeline(pwFile *os.File, nodeID uint32, fps int, bitrateKbps int, qp int) *Pipeline {
@@ -41,11 +42,57 @@ func NewPipeline(pwFile *os.File, nodeID uint32, fps int, bitrateKbps int, qp in
 	}
 }
 
-// Start launches the capture pipeline and streams complete Access Units to onFrame.
+// Start launches the capture pipeline and runs a supervisor loop that auto-revives it if killed.
 func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.stopped = false
+	p.mu.Unlock()
 
+	// Initial start
+	err := p.launchOnce(onFrame)
+	if err != nil {
+		return err
+	}
+
+	// Supervisor goroutine: auto-restarts GStreamer if fullscreen toggling resets PipeWire
+	go func() {
+		for {
+			p.mu.Lock()
+			if p.stopped {
+				p.mu.Unlock()
+				return
+			}
+			cmd := p.cmd
+			p.mu.Unlock()
+
+			if cmd != nil {
+				_ = cmd.Wait()
+			}
+
+			p.mu.Lock()
+			if p.stopped {
+				p.mu.Unlock()
+				return
+			}
+			p.mu.Unlock()
+
+			log.Printf("[capture] Stream interrupted (fullscreen/display mode change). Reviving pipeline in 200ms...")
+			time.Sleep(200 * time.Millisecond)
+
+			p.mu.Lock()
+			if !p.stopped {
+				if rErr := p.launchOnce(onFrame); rErr != nil {
+					log.Printf("[capture] Restart failed: %v, will retry...", rErr)
+				}
+			}
+			p.mu.Unlock()
+		}
+	}()
+
+	return nil
+}
+
+func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 	type encTier struct {
 		name    string
 		encoder string
@@ -69,7 +116,7 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 		log.Printf("[capture] Trying encoder: %s", tier.name)
 
 		pipelineStr := fmt.Sprintf(
-			"pipewiresrc fd=3 path=%d always-copy=true do-timestamp=true keepalive-time=1000 ! "+
+			"pipewiresrc fd=3 path=%d always-copy=true min-buffers=4 max-buffers=8 do-timestamp=true keepalive-time=1000 ! "+
 				"videorate drop-only=true max-rate=%d ! "+
 				"videoconvert ! "+
 				"video/x-raw,format=NV12 ! "+
@@ -125,8 +172,7 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 		p.cancel = cancel
 
 		// Read loop goroutine
-		go func(encSelected string) {
-			defer close(p.done)
+		go func(encSelected string, stderrBuf *bytes.Buffer) {
 			splitter := NewAUSplitter()
 			buf := make([]byte, 64*1024)
 			var frameCount int
@@ -151,10 +197,10 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 				}
 			}
 
-			if stderr.Len() > 0 {
-				log.Printf("[capture] GStreamer output: %s", strings.TrimSpace(stderr.String()))
+			if stderrBuf.Len() > 0 {
+				log.Printf("[capture] GStreamer output: %s", strings.TrimSpace(stderrBuf.String()))
 			}
-		}(tier.name)
+		}(tier.name, &stderr)
 
 		log.Printf("[capture] Capture pipeline running with %s", tier.name)
 		return nil
@@ -165,6 +211,10 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 
 // Stop shuts down the capture pipeline.
 func (p *Pipeline) Stop() {
+	p.mu.Lock()
+	p.stopped = true
+	p.mu.Unlock()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
