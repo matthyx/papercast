@@ -3,11 +3,14 @@ set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
-echo "==> Ensuring clean xdg-desktop-portal state..."
+# Ensure clean xdg-desktop-portal state
 systemctl --user restart xdg-desktop-portal.service 2>/dev/null || true
 
-echo "==> Setting up ADB reverse port forwarding (port 1701)..."
-adb reverse tcp:1701 tcp:1701 2>/dev/null || echo "(ADB device not found or already forwarded - continuing)"
+# If binary not built yet, build it
+if [ ! -f "$DIR/papercast" ]; then
+    echo "==> Building Papercast (Go)..."
+    export PATH=/usr/local/go/bin:$PATH
+    (cd "$DIR" && go build -o papercast .)
+fi
 
-echo "==> Starting Papercast..."
-PYTHONPATH="$DIR" python3 -m papercast "$@"
+exec "$DIR/papercast" "$@"
