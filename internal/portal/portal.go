@@ -28,6 +28,25 @@ type Session struct {
 	mu            sync.Mutex
 }
 
+// OpenPipeWireRemote opens a new PipeWire remote file descriptor on the active session.
+// This can be called repeatedly to revive GStreamer pipelines without prompting the user.
+func (s *Session) OpenPipeWireRemote() (*os.File, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, fmt.Errorf("session is closed")
+	}
+
+	portal := s.conn.Object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+	var fd dbus.UnixFD
+	err := portal.Call("org.freedesktop.portal.ScreenCast.OpenPipeWireRemote", 0, s.SessionHandle, map[string]dbus.Variant{}).Store(&fd)
+	if err != nil {
+		return nil, fmt.Errorf("OpenPipeWireRemote failed: %w", err)
+	}
+
+	return os.NewFile(uintptr(fd), "pipewire"), nil
+}
+
 func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -44,6 +63,9 @@ func (s *Session) Close() error {
 		sessionObj := s.conn.Object("org.freedesktop.portal.Desktop", s.SessionHandle)
 		_ = sessionObj.Call("org.freedesktop.portal.Session.Close", 0).Err
 		log.Printf("[portal] ScreenCast session closed: %s", s.SessionHandle)
+	}
+	if s.conn != nil {
+		_ = s.conn.Close()
 	}
 	return nil
 }
@@ -192,20 +214,19 @@ func RequestScreenCast(cursorMode uint32, timeout time.Duration) (*Session, erro
 	}
 	log.Printf("[portal] PipeWire stream ready (node_id=%d)", nodeID)
 
-	// 4. OpenPipeWireRemote
-	var fd dbus.UnixFD
-	err = portal.Call("org.freedesktop.portal.ScreenCast.OpenPipeWireRemote", 0, sessionHandle, map[string]dbus.Variant{}).Store(&fd)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("OpenPipeWireRemote failed: %w", err)
-	}
-
-	pwFile := os.NewFile(uintptr(fd), "pipewire")
-
-	return &Session{
-		PWFile:        pwFile,
+	sess := &Session{
 		NodeID:        nodeID,
 		SessionHandle: sessionHandle,
 		conn:          conn,
-	}, nil
+	}
+
+	// Initial PipeWire remote FD
+	pwFile, err := sess.OpenPipeWireRemote()
+	if err != nil {
+		sess.Close()
+		return nil, err
+	}
+	sess.PWFile = pwFile
+
+	return sess, nil
 }

@@ -1,3 +1,5 @@
+export PATH := /usr/local/go/bin:$(PATH)
+
 .PHONY: all build test clean install
 
 BINARY_NAME=papercast

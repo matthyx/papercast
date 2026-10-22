@@ -61,7 +61,7 @@ func main() {
 	defer session.Close()
 
 	// 4. Start GStreamer capture & encoding pipeline
-	pipeline := capture.NewPipeline(session.PWFile, session.NodeID, *fps, *bitrate, *qp)
+	pipeline := capture.NewPipeline(session.OpenPipeWireRemote, session.NodeID, *fps, *bitrate, *qp)
 	err = pipeline.Start(func(frame []byte, isKey bool) {
 		srv.BroadcastFrame(frame, isKey)
 	})

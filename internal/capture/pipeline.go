@@ -15,29 +15,33 @@ import (
 
 // Pipeline manages the GStreamer capture child process.
 type Pipeline struct {
-	pwFile      *os.File
+	openPW      func() (*os.File, error)
 	nodeID      uint32
 	fps         int
 	bitrateKbps int
 	qp          int
 
-	cmd     *exec.Cmd
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	stopped bool
-	done    chan struct{}
+	cmd         *exec.Cmd
+	cancel      context.CancelFunc
+	processDone chan struct{}
+	quit        chan struct{}
+	mu          sync.Mutex
+	stopped     bool
+	done        chan struct{}
 }
 
-func NewPipeline(pwFile *os.File, nodeID uint32, fps int, bitrateKbps int, qp int) *Pipeline {
+func NewPipeline(openPW func() (*os.File, error), nodeID uint32, fps int, bitrateKbps int, qp int) *Pipeline {
 	if qp <= 0 {
 		qp = 26
 	}
 	return &Pipeline{
-		pwFile:      pwFile,
+		openPW:      openPW,
 		nodeID:      nodeID,
 		fps:         fps,
 		bitrateKbps: bitrateKbps,
 		qp:          qp,
+		processDone: make(chan struct{}, 1),
+		quit:        make(chan struct{}),
 		done:        make(chan struct{}),
 	}
 }
@@ -54,38 +58,36 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 		return err
 	}
 
-	// Supervisor goroutine: auto-restarts GStreamer if fullscreen toggling resets PipeWire
+	// Supervisor goroutine: auto-restarts GStreamer with a fresh PipeWire connection if interrupted
 	go func() {
 		for {
-			p.mu.Lock()
-			if p.stopped {
-				p.mu.Unlock()
+			select {
+			case <-p.quit:
 				return
-			}
-			cmd := p.cmd
-			p.mu.Unlock()
-
-			if cmd != nil {
-				_ = cmd.Wait()
-			}
-
-			p.mu.Lock()
-			if p.stopped {
-				p.mu.Unlock()
-				return
-			}
-			p.mu.Unlock()
-
-			log.Printf("[capture] Stream interrupted (fullscreen/display mode change). Reviving pipeline in 200ms...")
-			time.Sleep(200 * time.Millisecond)
-
-			p.mu.Lock()
-			if !p.stopped {
-				if rErr := p.launchOnce(onFrame); rErr != nil {
-					log.Printf("[capture] Restart failed: %v, will retry...", rErr)
+			case <-p.processDone:
+				p.mu.Lock()
+				if p.stopped {
+					p.mu.Unlock()
+					return
 				}
+				p.mu.Unlock()
+
+				log.Printf("[capture] Stream interrupted (fullscreen/resolution change). Reviving pipeline in 200ms...")
+				time.Sleep(200 * time.Millisecond)
+
+				p.mu.Lock()
+				if !p.stopped {
+					if rErr := p.launchOnce(onFrame); rErr != nil {
+						log.Printf("[capture] Revive failed: %v, will retry in 1s...", rErr)
+						time.Sleep(1 * time.Second)
+						select {
+						case p.processDone <- struct{}{}:
+						default:
+						}
+					}
+				}
+				p.mu.Unlock()
 			}
-			p.mu.Unlock()
 		}
 	}()
 
@@ -115,9 +117,20 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 	for _, tier := range encoders {
 		log.Printf("[capture] Trying encoder: %s", tier.name)
 
+		// Request a fresh PipeWire remote FD for this GStreamer process
+		pwFile, err := p.openPW()
+		if err != nil {
+			return fmt.Errorf("failed to obtain PipeWire remote fd: %w", err)
+		}
+
+		// Stable PipeWire screen capture pipeline:
+		// - do-timestamp=true: assign stream timestamps to buffers
+		// - videorate drop-only=true skip-to-first=true: cleanly caps framerate at p.fps without frame duplication
+		// - videoconvert: standardizes any compositor buffer format into NV12
+		// - queue leaky=downstream: decouples capture from hardware encoding
 		pipelineStr := fmt.Sprintf(
-			"pipewiresrc fd=3 path=%d always-copy=true min-buffers=4 max-buffers=8 do-timestamp=true keepalive-time=1000 ! "+
-				"videorate drop-only=true max-rate=%d ! "+
+			"pipewiresrc fd=3 path=%d do-timestamp=true ! "+
+				"videorate drop-only=true skip-to-first=true max-rate=%d ! "+
 				"videoconvert ! "+
 				"video/x-raw,format=NV12 ! "+
 				"queue max-size-buffers=2 leaky=downstream ! "+
@@ -131,10 +144,11 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cmd := exec.CommandContext(ctx, "gst-launch-1.0", strings.Fields(pipelineStr)...)
-		cmd.ExtraFiles = []*os.File{p.pwFile}
+		cmd.ExtraFiles = []*os.File{pwFile}
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
+			_ = pwFile.Close()
 			cancel()
 			lastErr = err
 			continue
@@ -144,6 +158,10 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 		cmd.Stderr = &stderr
 
 		err = cmd.Start()
+		// In Go, cmd.ExtraFiles are duplicated into the child during Start().
+		// Closing the parent's file descriptor immediately prevents leaks while child retains fd 3.
+		_ = pwFile.Close()
+
 		if err != nil {
 			cancel()
 			lastErr = err
@@ -151,28 +169,25 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 			continue
 		}
 
-		// Verify pipeline survives preroll before declaring success
-		exitChan := make(chan error, 1)
-		go func() {
-			exitChan <- cmd.Wait()
-		}()
-
-		select {
-		case exitErr := <-exitChan:
-			cancel()
-			stderrMsg := strings.TrimSpace(stderr.String())
-			lastErr = fmt.Errorf("%s failed to preroll: %v (stderr: %s)", tier.name, exitErr, stderrMsg)
-			log.Printf("[capture] %s failed to preroll: %s", tier.name, stderrMsg)
-			continue
-		case <-time.After(400 * time.Millisecond):
-			// Pipeline successfully prerolled and is streaming
-		}
-
 		p.cmd = cmd
 		p.cancel = cancel
 
 		// Read loop goroutine
+		childDone := make(chan struct{})
 		go func(encSelected string, stderrBuf *bytes.Buffer) {
+			defer func() {
+				_ = cmd.Wait()
+				if stderrBuf.Len() > 0 {
+					log.Printf("[capture] GStreamer output: %s", strings.TrimSpace(stderrBuf.String()))
+				}
+				close(childDone)
+				// Signal supervisor that process has terminated
+				select {
+				case p.processDone <- struct{}{}:
+				default:
+				}
+			}()
+
 			splitter := NewAUSplitter()
 			buf := make([]byte, 64*1024)
 			var frameCount int
@@ -196,11 +211,19 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 					break
 				}
 			}
-
-			if stderrBuf.Len() > 0 {
-				log.Printf("[capture] GStreamer output: %s", strings.TrimSpace(stderrBuf.String()))
-			}
 		}(tier.name, &stderr)
+
+		// Verify pipeline survives preroll before declaring success
+		select {
+		case <-childDone:
+			cancel()
+			stderrMsg := strings.TrimSpace(stderr.String())
+			lastErr = fmt.Errorf("%s failed to preroll: %s", tier.name, stderrMsg)
+			log.Printf("[capture] %s failed to preroll: %s", tier.name, stderrMsg)
+			continue
+		case <-time.After(350 * time.Millisecond):
+			// Pipeline successfully prerolled and is streaming
+		}
 
 		log.Printf("[capture] Capture pipeline running with %s", tier.name)
 		return nil
@@ -212,11 +235,12 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 // Stop shuts down the capture pipeline.
 func (p *Pipeline) Stop() {
 	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		return
+	}
 	p.stopped = true
-	p.mu.Unlock()
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	close(p.quit)
 
 	if p.cancel != nil {
 		p.cancel()
@@ -225,6 +249,7 @@ func (p *Pipeline) Stop() {
 	if p.cmd != nil && p.cmd.Process != nil {
 		_ = p.cmd.Process.Kill()
 	}
+	p.mu.Unlock()
 }
 
 // Wait blocks until the capture pipeline terminates.
