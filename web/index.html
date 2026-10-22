@@ -217,7 +217,7 @@
                 error: (e) => {
                     console.error("VideoDecoder error:", e);
                     hasReceivedKeyframe = false;
-                    setTimeout(initDecoder, 300);
+                    initDecoder();
                 }
             });
 
@@ -308,7 +308,10 @@
                     } catch (err) {
                         console.warn("Decode chunk error:", err);
                         hasReceivedKeyframe = false;
+                        initDecoder();
                     }
+                } else if (!decoder || decoder.state === "closed") {
+                    initDecoder();
                 }
             };
 

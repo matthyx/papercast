@@ -78,3 +78,43 @@ func TestAUSplitter(t *testing.T) {
 		t.Errorf("Expected extracted[1] to not be keyframe")
 	}
 }
+
+func TestAUSplitterWithAUD(t *testing.T) {
+	splitter := NewAUSplitter()
+
+	aud := []byte{0x00, 0x00, 0x00, 0x01, 0x09, 0x10}
+	sps := []byte{0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e}
+	pps := []byte{0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38, 0x80}
+	idr := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00}
+	expectedIDR := append(append(append(append([]byte{}, aud...), sps...), pps...), idr...)
+
+	p1AUD := []byte{0x00, 0x00, 0x00, 0x01, 0x09, 0x10}
+	p1Slice := []byte{0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x02}
+	expectedP1 := append(append([]byte{}, p1AUD...), p1Slice...)
+
+	nextAUD := []byte{0x00, 0x00, 0x00, 0x01, 0x09, 0x10}
+
+	data := append(append(append([]byte{}, expectedIDR...), expectedP1...), nextAUD...)
+
+	frames := splitter.Push(data)
+	for i, f := range frames {
+		t.Logf("Extracted frame %d: len=%d isKey=%v", i, len(f), IsKeyframe(f))
+	}
+
+	if len(frames) != 2 {
+		t.Fatalf("Expected 2 complete frames, got %d", len(frames))
+	}
+
+	if !bytes.Equal(frames[0], expectedIDR) {
+		t.Errorf("Frame 0 mismatch: got len=%d, expected len=%d", len(frames[0]), len(expectedIDR))
+	}
+	if !IsKeyframe(frames[0]) {
+		t.Errorf("Expected Frame 0 to be keyframe")
+	}
+	if !bytes.Equal(frames[1], expectedP1) {
+		t.Errorf("Frame 1 mismatch: got len=%d, expected len=%d", len(frames[1]), len(expectedP1))
+	}
+	if IsKeyframe(frames[1]) {
+		t.Errorf("Expected Frame 1 to not be keyframe")
+	}
+}

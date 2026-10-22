@@ -121,15 +121,20 @@ func (s *AUSplitter) extractOne() []byte {
 
 		// Check if this NAL indicates start of a new Access Unit
 		isNewAU := false
-		switch nalType {
-		case NALTypeAUD:
+		if nalType == NALTypeAUD {
+			// An Access Unit Delimiter marks the boundary of a new Access Unit
 			isNewAU = true
-		case NALTypeSPS:
-			isNewAU = true
-		case NALTypeSliceIDR, NALTypeSliceNonIDR:
-			if hasSlice {
+		} else if hasSlice {
+			// Once we have a slice in the current AU, any subsequent parameter sets,
+			// SEI, or new slices indicate the beginning of the next Access Unit.
+			switch nalType {
+			case NALTypeSPS, NALTypePPS, NALTypeSEI, NALTypeSliceIDR, NALTypeSliceNonIDR:
 				isNewAU = true
-			} else {
+			}
+		} else {
+			// We haven't seen a slice yet for the current picture.
+			// Non-VCL units (SPS, PPS, SEI) belong to the header of the current picture.
+			if nalType == NALTypeSliceIDR || nalType == NALTypeSliceNonIDR {
 				hasSlice = true
 			}
 		}

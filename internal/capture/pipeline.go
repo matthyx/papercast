@@ -139,14 +139,14 @@ func (p *Pipeline) launchOnce(onFrame func(frame []byte, isKey bool)) error {
 			// - always-copy=true: releases PipeWire compositor buffer immediately, preventing buffer starvation in cosmic-comp
 			// - min-buffers=1 max-buffers=2: enforces strict double-buffering so cosmic-comp never receives concurrent create_frame requests
 			// - do-timestamp=true: assign stream timestamps to buffers
+			// - videoconvert: standardizes any compositor buffer format into NV12 directly from pipewiresrc
 			// - videorate drop-only=true skip-to-first=true: cleanly caps framerate at p.fps without frame duplication
-			// - videoconvert: standardizes any compositor buffer format into NV12
 			// - queue leaky=downstream: decouples capture from hardware encoding
 			pipelineStr = fmt.Sprintf(
 				"pipewiresrc fd=3 path=%d always-copy=true min-buffers=1 max-buffers=2 do-timestamp=true ! "+
-					"videorate drop-only=true skip-to-first=true max-rate=%d ! "+
 					"videoconvert ! "+
 					"video/x-raw,format=NV12 ! "+
+					"videorate drop-only=true skip-to-first=true max-rate=%d ! "+
 					"queue max-size-buffers=2 leaky=downstream ! "+
 					"%s ! "+
 					"video/x-h264,profile=constrained-baseline ! "+
