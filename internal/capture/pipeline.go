@@ -47,28 +47,19 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 	defer p.mu.Unlock()
 
 	type encTier struct {
-		name     string
-		filter   string
-		encoder  string
+		name    string
+		encoder string
 	}
 
 	encoders := []encTier{
-		// 1. Full GPU pipeline: VA-API GPU color conversion + VA-API hardware encode (lowest CPU)
+		// 1. VA-API hardware encode (zero latency)
 		{
-			name:    "vaapi (full GPU)",
-			filter:  "vaapipostproc",
+			name:    "vaapi (hardware)",
 			encoder: fmt.Sprintf("vaapih264enc rate-control=cqp init-qp=%d max-bframes=0 keyframe-period=%d", p.qp, p.fps),
 		},
-		// 2. Hybrid: CPU videoconvert + VA-API hardware encode
-		{
-			name:    "vaapi (CPU convert)",
-			filter:  "videoconvert ! video/x-raw,format=NV12",
-			encoder: fmt.Sprintf("vaapih264enc rate-control=cqp init-qp=%d max-bframes=0 keyframe-period=%d", p.qp, p.fps),
-		},
-		// 3. Pure software fallback
+		// 2. Pure software fallback
 		{
 			name:    "x264enc (software)",
-			filter:  "videoconvert ! video/x-raw,format=NV12",
 			encoder: fmt.Sprintf("x264enc tune=zerolatency speed-preset=ultrafast bitrate=%d key-int-max=%d", p.bitrateKbps, p.fps),
 		},
 	}
@@ -79,15 +70,16 @@ func (p *Pipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 
 		pipelineStr := fmt.Sprintf(
 			"pipewiresrc fd=3 path=%d always-copy=true do-timestamp=true keepalive-time=1000 ! "+
-				"queue max-size-buffers=2 leaky=downstream ! "+
 				"videorate drop-only=true max-rate=%d ! "+
-				"%s ! "+
+				"videoconvert ! "+
+				"video/x-raw,format=NV12 ! "+
+				"queue max-size-buffers=2 leaky=downstream ! "+
 				"%s ! "+
 				"video/x-h264,profile=constrained-baseline ! "+
 				"h264parse config-interval=-1 ! "+
 				"video/x-h264,stream-format=byte-stream,alignment=au ! "+
 				"fdsink fd=1 sync=false",
-			p.nodeID, p.fps, tier.filter, tier.encoder,
+			p.nodeID, p.fps, tier.encoder,
 		)
 
 		ctx, cancel := context.WithCancel(context.Background())

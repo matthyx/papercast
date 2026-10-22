@@ -158,8 +158,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	delete(s.clients, c)
-	close(c.ch)
+	if _, exists := s.clients[c]; exists {
+		delete(s.clients, c)
+		close(c.ch)
+	}
 	remaining := len(s.clients)
 	s.mu.Unlock()
 
