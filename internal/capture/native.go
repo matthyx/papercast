@@ -71,6 +71,7 @@ type Pipeline struct {
 	isStreaming       atomic.Bool
 	lastFrameUnixNano int64
 	totalFrames       uint64
+	streamEpoch       uint64
 
 	pauseMu    sync.Mutex
 	pauseTimer *time.Timer
@@ -236,7 +237,11 @@ func (p *NativePipeline) handleStateChange(oldState, newState int) {
 		if p.pauseTimer != nil {
 			p.pauseTimer.Stop()
 		}
+		epoch := atomic.LoadUint64(&p.streamEpoch)
 		p.pauseTimer = time.AfterFunc(150*time.Millisecond, func() {
+			if atomic.LoadUint64(&p.streamEpoch) != epoch {
+				return // stale timer from previous stream session
+			}
 			select {
 			case p.reviveChan <- struct{}{}:
 			default:
@@ -261,6 +266,15 @@ func (p *NativePipeline) supervisorLoop() {
 				return
 			}
 			p.isStreaming.Store(false)
+			atomic.AddUint64(&p.streamEpoch, 1)
+
+			p.pauseMu.Lock()
+			if p.pauseTimer != nil {
+				p.pauseTimer.Stop()
+				p.pauseTimer = nil
+			}
+			p.pauseMu.Unlock()
+
 			log.Printf("[native] ScreenCast stream suspended or terminated. Reviving session via restore token...")
 
 			if p.cCap != nil {
