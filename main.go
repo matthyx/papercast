@@ -60,64 +60,53 @@ func main() {
 		Stop()
 	}
 
+	var (
+		currentSession *portal.Session
+		sessMu         sync.Mutex
+	)
+
+	sessionProvider := func() (*os.File, uint32, error) {
+		sessMu.Lock()
+		defer sessMu.Unlock()
+
+		if currentSession != nil {
+			_ = currentSession.Close()
+			currentSession = nil
+		}
+
+		log.Printf("[portal] Acquiring fresh ScreenCast session via restore token...")
+		sess, err := portal.RequestScreenCast(uint32(*cursorMode), 10*time.Second)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to acquire portal session: %w", err)
+		}
+		currentSession = sess
+
+		pwFile, err := sess.OpenPipeWireRemote()
+		if err != nil {
+			return nil, 0, err
+		}
+		return pwFile, sess.NodeID, nil
+	}
+
+	defer func() {
+		sessMu.Lock()
+		if currentSession != nil {
+			_ = currentSession.Close()
+		}
+		sessMu.Unlock()
+	}()
+
 	var pipeline streamPipeline
 	if *testMode {
 		log.Printf("[capture] Running in autonomous test mode with SMPTE test pattern (GStreamer)")
 		pipeline = capture.NewPipeline(nil, *fps, *bitrate, *qp)
 	} else if *useGst {
 		log.Printf("[capture] Using legacy GStreamer capture pipeline")
-		var (
-			currentSession *portal.Session
-			sessMu         sync.Mutex
-		)
-
-		sessionProvider := func() (*os.File, uint32, error) {
-			sessMu.Lock()
-			defer sessMu.Unlock()
-
-			if currentSession != nil {
-				_ = currentSession.Close()
-				currentSession = nil
-			}
-
-			log.Printf("[portal] Acquiring fresh ScreenCast session via restore token...")
-			sess, err := portal.RequestScreenCast(uint32(*cursorMode), 10*time.Second)
-			if err != nil {
-				return nil, 0, fmt.Errorf("failed to acquire portal session: %w", err)
-			}
-			currentSession = sess
-
-			pwFile, err := sess.OpenPipeWireRemote()
-			if err != nil {
-				return nil, 0, err
-			}
-			return pwFile, sess.NodeID, nil
-		}
-
-		defer func() {
-			sessMu.Lock()
-			if currentSession != nil {
-				_ = currentSession.Close()
-			}
-			sessMu.Unlock()
-		}()
-
 		pipeline = capture.NewPipeline(sessionProvider, *fps, *bitrate, *qp)
 	} else {
 		// Native libpipewire + hardware VA-API capture engine (default)
 		log.Printf("[capture] Initializing native libpipewire + VA-API zero-latency capture engine...")
-		sess, err := portal.RequestScreenCast(uint32(*cursorMode), 10*time.Second)
-		if err != nil {
-			log.Fatalf("[portal] Portal authorization error: %v", err)
-		}
-		defer sess.Close()
-
-		pwFile, err := sess.OpenPipeWireRemote()
-		if err != nil {
-			log.Fatalf("[portal] OpenPipeWireRemote error: %v", err)
-		}
-
-		pipeline = capture.NewNativePipeline(pwFile, sess.NodeID, *fps, *qp)
+		pipeline = capture.NewNativePipeline(sessionProvider, *fps, *qp)
 	}
 
 	// 4. Start capture & encoding pipeline

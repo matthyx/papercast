@@ -27,6 +27,7 @@ struct native_capture {
     struct pw_thread_loop *thread_loop;
     struct pw_context *context;
     struct pw_core *core;
+    struct spa_hook core_listener;
     struct pw_stream *stream;
     struct spa_hook stream_listener;
     struct spa_video_info_raw video_format;
@@ -187,7 +188,7 @@ static enum AVPixelFormat spa_format_to_av(uint32_t spa_format) {
         case SPA_VIDEO_FORMAT_BGRA: return AV_PIX_FMT_BGRA;
         case SPA_VIDEO_FORMAT_BGRx: return AV_PIX_FMT_BGR0;
         case SPA_VIDEO_FORMAT_NV12: return AV_PIX_FMT_NV12;
-        default: return AV_PIX_FMT_BGR0;
+        default: return AV_PIX_FMT_RGBA;
     }
 }
 
@@ -199,7 +200,7 @@ static void on_process(void *userdata) {
     struct spa_buffer *buf = b->buffer;
     uint8_t *src_data = buf->datas[0].data;
 
-    if (src_data != NULL && cap->enc_ctx != NULL) {
+    if (src_data != NULL && cap->enc_ctx != NULL && cap->sws != NULL && cap->sw_frame != NULL) {
         uint8_t *src_slices[1] = { src_data };
         int src_stride = buf->datas[0].chunk->stride;
         if (src_stride <= 0) {
@@ -207,11 +208,15 @@ static void on_process(void *userdata) {
         }
         int src_strides[1] = { src_stride };
 
-        // Scale/convert into input format
+        // Scale/convert into encoder input frame
         sws_scale(cap->sws, (const uint8_t * const*)src_slices, src_strides, 0, cap->enc_height,
                   cap->sw_frame->data, cap->sw_frame->linesize);
 
         cap->sw_frame->pts = cap->frame_index++;
+
+        // Return PipeWire buffer back IMMEDIATELY so compositor/portal never starves or crashes
+        pw_stream_queue_buffer(cap->stream, b);
+        b = NULL;
 
         if (cap->is_hw_vaapi) {
             if (av_hwframe_get_buffer(cap->enc_ctx->hw_frames_ctx, cap->hw_frame, 0) == 0) {
@@ -238,12 +243,19 @@ static void on_process(void *userdata) {
         }
     }
 
-    pw_stream_queue_buffer(cap->stream, b);
+    if (b) {
+        pw_stream_queue_buffer(cap->stream, b);
+    }
 }
 
 static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *param) {
     struct native_capture *cap = userdata;
-    if (!param || id != SPA_PARAM_Format) return;
+    if (id != SPA_PARAM_Format) return;
+
+    if (!param) {
+        cap->has_format = false;
+        return;
+    }
 
     if (spa_format_video_raw_parse(param, &cap->video_format) < 0) {
         fprintf(stderr, "[native] Error: failed to parse raw video format\n");
@@ -265,7 +277,7 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
 
     cap->has_format = true;
 
-    // Acknowledge parameters and request buffers
+    // Acknowledge parameters and request buffers (support both MemPtr and MemFd)
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     const struct spa_pod *params[1];
@@ -273,7 +285,7 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
         SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
         SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
-        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int((1<<SPA_DATA_MemPtr))
+        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int((1<<SPA_DATA_MemPtr) | (1<<SPA_DATA_MemFd))
     );
     pw_stream_update_params(cap->stream, params, 1);
 }
@@ -285,6 +297,7 @@ static void on_state_changed(void *userdata, enum pw_stream_state old, enum pw_s
     if (state == PW_STREAM_STATE_PAUSED) {
         pw_stream_set_active(cap->stream, true);
     }
+    goOnNativeState((int)old, (int)state, cap->go_handle);
 }
 
 static const struct pw_stream_events stream_events = {
@@ -292,6 +305,18 @@ static const struct pw_stream_events stream_events = {
     .process = on_process,
     .param_changed = on_param_changed,
     .state_changed = on_state_changed,
+};
+
+static void on_core_error(void *data, uint32_t id, int seq, int res, const char *message) {
+    struct native_capture *cap = data;
+    fprintf(stderr, "[native] PipeWire core error (id=%u, res=%d): %s\n", id, res, message ? message : "none");
+    // Signal fatal stream error to Go supervisor to trigger instant revive
+    goOnNativeState(3, -1, cap->go_handle);
+}
+
+static const struct pw_core_events core_events = {
+    .version = PW_VERSION_CORE_EVENTS,
+    .error = on_core_error,
 };
 
 native_capture_t *native_capture_create(int pw_fd, uint32_t node_id, int fps, int qp, uintptr_t go_handle) {
@@ -322,6 +347,7 @@ int native_capture_start(native_capture_t *cap) {
         pw_thread_loop_unlock(cap->thread_loop);
         return -1;
     }
+    pw_core_add_listener(cap->core, &cap->core_listener, &core_events, cap);
 
     struct pw_properties *props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Video",
@@ -393,6 +419,10 @@ void native_capture_stop(native_capture_t *cap) {
     if (cap->stream) {
         pw_stream_destroy(cap->stream);
         cap->stream = NULL;
+    }
+    if (cap->core) {
+        spa_hook_remove(&cap->core_listener);
+        cap->core = NULL;
     }
     if (cap->context) {
         pw_context_destroy(cap->context);
