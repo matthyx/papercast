@@ -28,7 +28,14 @@ func goOnNativeFrame(data *C.uint8_t, size C.size_t, isKey C.bool, goHandle C.ui
 		return
 	}
 	pipeline := val.(*NativePipeline)
-	atomic.StoreInt64(&pipeline.lastFrameUnixNano, time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	atomic.StoreInt64(&pipeline.lastFrameUnixNano, now)
+	total := atomic.AddUint64(&pipeline.totalFrames, 1)
+
+	if total == 1 {
+		log.Printf("[native] First frame encoded (%d bytes, keyframe=%v)", int(size), bool(isKey))
+	}
+
 	if pipeline.onFrame != nil {
 		buf := C.GoBytes(unsafe.Pointer(data), C.int(size))
 		pipeline.onFrame(buf, bool(isKey))
@@ -47,18 +54,19 @@ func goOnNativeState(oldState C.int, newState C.int, goHandle C.uintptr_t) {
 
 // NativePipeline manages direct PipeWire stream capture and hardware VA-API encoding without GStreamer.
 type NativePipeline struct {
-	sessionProvider    SessionProvider
-	pwFile             *os.File
-	nodeID             uint32
-	fps                int
-	qp                 int
-	handle             uintptr
-	cCap               *C.native_capture_t
-	onFrame            func(frame []byte, isKey bool)
-	mu                 sync.Mutex
-	stopped            atomic.Bool
-	isStreaming        atomic.Bool
-	lastFrameUnixNano  int64
+	sessionProvider   SessionProvider
+	pwFile            *os.File
+	nodeID            uint32
+	fps               int
+	qp                int
+	handle            uintptr
+	cCap              *C.native_capture_t
+	onFrame           func(frame []byte, isKey bool)
+	mu                sync.Mutex
+	stopped           atomic.Bool
+	isStreaming       atomic.Bool
+	lastFrameUnixNano int64
+	totalFrames       uint64
 
 	pauseMu    sync.Mutex
 	pauseTimer *time.Timer
@@ -96,20 +104,36 @@ func NewNativePipeline(sessionProvider SessionProvider, fps int, qp int) *Native
 
 func (p *NativePipeline) watchdogLoop() {
 	ticker := time.NewTicker(200 * time.Millisecond)
+	statsTicker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	defer statsTicker.Stop()
+
+	var lastLoggedFrames uint64
+	lastLoggedTime := time.Now()
 
 	for {
 		select {
 		case <-p.quit:
 			return
+		case <-statsTicker.C:
+			if p.isStreaming.Load() {
+				total := atomic.LoadUint64(&p.totalFrames)
+				elapsed := time.Since(lastLoggedTime).Seconds()
+				if elapsed > 0 {
+					fps := float64(total-lastLoggedFrames) / elapsed
+					log.Printf("[native] Stream healthy: %.1f FPS (%d total frames)", fps, total)
+				}
+				lastLoggedFrames = total
+				lastLoggedTime = time.Now()
+			}
 		case <-ticker.C:
 			if p.stopped.Load() {
 				return
 			}
 			if p.isStreaming.Load() {
 				last := atomic.LoadInt64(&p.lastFrameUnixNano)
-				if last > 0 && time.Since(time.Unix(0, last)) > 600*time.Millisecond {
-					log.Printf("[native] ScreenCast stream stalled (>600ms without frames). Reviving immediately...")
+				if last > 0 && time.Since(time.Unix(0, last)) > 750*time.Millisecond {
+					log.Printf("[native] ScreenCast stream stalled (>750ms without frames). Reviving immediately...")
 					atomic.StoreInt64(&p.lastFrameUnixNano, time.Now().UnixNano())
 					select {
 					case p.reviveChan <- struct{}{}:

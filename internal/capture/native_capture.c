@@ -419,11 +419,11 @@ int native_capture_start(native_capture_t *cap) {
         0);
     params[0] = spa_pod_builder_pop(&b, &f[0]);
 
-    // Connect directly to target node with DONT_RECONNECT so PipeWire doesn't hang in limbo when portal crashes
+    // Connect directly to target node with AUTOCONNECT (links to node) and DONT_RECONNECT (avoids 30s limbo if node dies)
     int res = pw_stream_connect(cap->stream,
         PW_DIRECTION_INPUT,
         cap->node_id,
-        PW_STREAM_FLAG_DONT_RECONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_ASYNC,
+        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_DONT_RECONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_ASYNC,
         params, 1);
 
     pw_thread_loop_unlock(cap->thread_loop);
