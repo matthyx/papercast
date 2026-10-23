@@ -116,9 +116,7 @@ func NewNativePipeline(sessionProvider SessionProvider, fps int, qp int) *Pipeli
 }
 
 func (p *NativePipeline) watchdogLoop() {
-	ticker := time.NewTicker(200 * time.Millisecond)
 	statsTicker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
 	defer statsTicker.Stop()
 
 	var (
@@ -166,22 +164,6 @@ func (p *NativePipeline) watchdogLoop() {
 
 			lastLoggedFrames = total
 			lastLoggedTime = time.Now()
-
-		case <-ticker.C:
-			if p.stopped.Load() {
-				return
-			}
-			if p.isStreaming.Load() {
-				last := atomic.LoadInt64(&p.lastFrameUnixNano)
-				if last > 0 && time.Since(time.Unix(0, last)) > 750*time.Millisecond {
-					log.Printf("[native] ScreenCast stream stalled (>750ms without frames). Reviving immediately...")
-					atomic.StoreInt64(&p.lastFrameUnixNano, time.Now().UnixNano())
-					select {
-					case p.reviveChan <- struct{}{}:
-					default:
-					}
-				}
-			}
 		}
 	}
 }
