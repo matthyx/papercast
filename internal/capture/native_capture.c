@@ -28,11 +28,14 @@ struct native_capture {
     struct pw_context *context;
     struct pw_core *core;
     struct spa_hook core_listener;
+    struct pw_registry *registry;
+    struct spa_hook registry_listener;
     struct pw_stream *stream;
     struct spa_hook stream_listener;
     struct spa_video_info_raw video_format;
     bool has_format;
     bool running;
+    bool stopping;
 
     // Encoder
     const AVCodec *codec;
@@ -292,6 +295,7 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
 
 static void on_state_changed(void *userdata, enum pw_stream_state old, enum pw_stream_state state, const char *error) {
     struct native_capture *cap = userdata;
+    if (cap->stopping) return;
     fprintf(stderr, "[native] PipeWire stream state: %s -> %s (err: %s)\n",
             pw_stream_state_as_string(old), pw_stream_state_as_string(state), error ? error : "none");
     if (state == PW_STREAM_STATE_PAUSED) {
@@ -309,14 +313,33 @@ static const struct pw_stream_events stream_events = {
 
 static void on_core_error(void *data, uint32_t id, int seq, int res, const char *message) {
     struct native_capture *cap = data;
+    if (cap->stopping) return;
     fprintf(stderr, "[native] PipeWire core error (id=%u, res=%d): %s\n", id, res, message ? message : "none");
-    // Signal fatal stream error to Go supervisor to trigger instant revive
     goOnNativeState(3, -1, cap->go_handle);
 }
 
 static const struct pw_core_events core_events = {
     .version = PW_VERSION_CORE_EVENTS,
     .error = on_core_error,
+};
+
+static void on_registry_global(void *data, uint32_t id, uint32_t permissions, const char *type, uint32_t version, const struct spa_dict *props) {
+    // Unused
+}
+
+static void on_registry_global_remove(void *data, uint32_t id) {
+    struct native_capture *cap = data;
+    if (cap->stopping) return;
+    if (id == cap->node_id) {
+        fprintf(stderr, "[native] ScreenCast source node %u removed from PipeWire registry! Reviving immediately...\n", id);
+        goOnNativeState(3, -1, cap->go_handle);
+    }
+}
+
+static const struct pw_registry_events registry_events = {
+    .version = PW_VERSION_REGISTRY_EVENTS,
+    .global = on_registry_global,
+    .global_remove = on_registry_global_remove,
 };
 
 native_capture_t *native_capture_create(int pw_fd, uint32_t node_id, int fps, int qp, uintptr_t go_handle) {
@@ -348,6 +371,11 @@ int native_capture_start(native_capture_t *cap) {
         return -1;
     }
     pw_core_add_listener(cap->core, &cap->core_listener, &core_events, cap);
+
+    cap->registry = pw_core_get_registry(cap->core, PW_VERSION_REGISTRY, 0);
+    if (cap->registry) {
+        pw_registry_add_listener(cap->registry, &cap->registry_listener, &registry_events, cap);
+    }
 
     struct pw_properties *props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Video",
@@ -391,10 +419,11 @@ int native_capture_start(native_capture_t *cap) {
         0);
     params[0] = spa_pod_builder_pop(&b, &f[0]);
 
+    // Connect directly to target node with DONT_RECONNECT so PipeWire doesn't hang in limbo when portal crashes
     int res = pw_stream_connect(cap->stream,
         PW_DIRECTION_INPUT,
         cap->node_id,
-        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_ASYNC,
+        PW_STREAM_FLAG_DONT_RECONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_ASYNC,
         params, 1);
 
     pw_thread_loop_unlock(cap->thread_loop);
@@ -411,6 +440,7 @@ int native_capture_start(native_capture_t *cap) {
 
 void native_capture_stop(native_capture_t *cap) {
     if (!cap || !cap->running) return;
+    cap->stopping = true;
     cap->running = false;
 
     if (cap->thread_loop) {
@@ -419,6 +449,11 @@ void native_capture_stop(native_capture_t *cap) {
     if (cap->stream) {
         pw_stream_destroy(cap->stream);
         cap->stream = NULL;
+    }
+    if (cap->registry) {
+        spa_hook_remove(&cap->registry_listener);
+        pw_proxy_destroy((struct pw_proxy *)cap->registry);
+        cap->registry = NULL;
     }
     if (cap->core) {
         spa_hook_remove(&cap->core_listener);

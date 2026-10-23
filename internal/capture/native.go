@@ -28,6 +28,7 @@ func goOnNativeFrame(data *C.uint8_t, size C.size_t, isKey C.bool, goHandle C.ui
 		return
 	}
 	pipeline := val.(*NativePipeline)
+	atomic.StoreInt64(&pipeline.lastFrameUnixNano, time.Now().UnixNano())
 	if pipeline.onFrame != nil {
 		buf := C.GoBytes(unsafe.Pointer(data), C.int(size))
 		pipeline.onFrame(buf, bool(isKey))
@@ -46,16 +47,18 @@ func goOnNativeState(oldState C.int, newState C.int, goHandle C.uintptr_t) {
 
 // NativePipeline manages direct PipeWire stream capture and hardware VA-API encoding without GStreamer.
 type NativePipeline struct {
-	sessionProvider SessionProvider
-	pwFile          *os.File
-	nodeID          uint32
-	fps             int
-	qp              int
-	handle          uintptr
-	cCap            *C.native_capture_t
-	onFrame         func(frame []byte, isKey bool)
-	mu              sync.Mutex
-	stopped         atomic.Bool
+	sessionProvider    SessionProvider
+	pwFile             *os.File
+	nodeID             uint32
+	fps                int
+	qp                 int
+	handle             uintptr
+	cCap               *C.native_capture_t
+	onFrame            func(frame []byte, isKey bool)
+	mu                 sync.Mutex
+	stopped            atomic.Bool
+	isStreaming        atomic.Bool
+	lastFrameUnixNano  int64
 
 	pauseMu    sync.Mutex
 	pauseTimer *time.Timer
@@ -85,7 +88,37 @@ func NewNativePipeline(sessionProvider SessionProvider, fps int, qp int) *Native
 	// Supervisor loop: auto-recovers if compositor pauses or detaches the stream node
 	go p.supervisorLoop()
 
+	// Watchdog loop: detects silent PipeWire frame starvation (>600ms without frames while active)
+	go p.watchdogLoop()
+
 	return p
+}
+
+func (p *NativePipeline) watchdogLoop() {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.quit:
+			return
+		case <-ticker.C:
+			if p.stopped.Load() {
+				return
+			}
+			if p.isStreaming.Load() {
+				last := atomic.LoadInt64(&p.lastFrameUnixNano)
+				if last > 0 && time.Since(time.Unix(0, last)) > 600*time.Millisecond {
+					log.Printf("[native] ScreenCast stream stalled (>600ms without frames). Reviving immediately...")
+					atomic.StoreInt64(&p.lastFrameUnixNano, time.Now().UnixNano())
+					select {
+					case p.reviveChan <- struct{}{}:
+					default:
+					}
+				}
+			}
+		}
+	}
 }
 
 func (p *NativePipeline) handleStateChange(oldState, newState int) {
@@ -104,12 +137,15 @@ func (p *NativePipeline) handleStateChange(oldState, newState int) {
 
 	if newState == 3 {
 		// Streaming active, cancel any pending revive
+		p.isStreaming.Store(true)
+		atomic.StoreInt64(&p.lastFrameUnixNano, time.Now().UnixNano())
 		if p.pauseTimer != nil {
 			p.pauseTimer.Stop()
 			p.pauseTimer = nil
 		}
 		return
 	}
+	p.isStreaming.Store(false)
 
 	// Initial connection phases: unconnected (0) -> connecting (1) -> paused (2)
 	// Do not trigger revive during initial startup
@@ -160,6 +196,7 @@ func (p *NativePipeline) supervisorLoop() {
 				p.mu.Unlock()
 				return
 			}
+			p.isStreaming.Store(false)
 			log.Printf("[native] ScreenCast stream suspended or terminated. Reviving session via restore token...")
 
 			if p.cCap != nil {
@@ -170,6 +207,14 @@ func (p *NativePipeline) supervisorLoop() {
 			if p.pwFile != nil {
 				_ = p.pwFile.Close()
 				p.pwFile = nil
+			}
+
+			// Drain any pending revive tokens so we don't double-revive
+			for len(p.reviveChan) > 0 {
+				select {
+				case <-p.reviveChan:
+				default:
+				}
 			}
 
 			if p.sessionProvider != nil {
@@ -187,6 +232,7 @@ func (p *NativePipeline) supervisorLoop() {
 
 				p.pwFile = pwFile
 				p.nodeID = nodeID
+				atomic.StoreInt64(&p.lastFrameUnixNano, time.Now().UnixNano())
 				fd := C.int(p.pwFile.Fd())
 				cCap := C.native_capture_create(fd, C.uint32_t(p.nodeID), C.int(p.fps), C.int(p.qp), C.uintptr_t(p.handle))
 				if cCap == nil || C.native_capture_start(cCap) != 0 {
@@ -231,6 +277,7 @@ func (p *NativePipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 		return fmt.Errorf("no PipeWire file descriptor available")
 	}
 
+	atomic.StoreInt64(&p.lastFrameUnixNano, time.Now().UnixNano())
 	fd := C.int(p.pwFile.Fd())
 	nodeID := C.uint32_t(p.nodeID)
 	fps := C.int(p.fps)
@@ -257,6 +304,7 @@ func (p *NativePipeline) Stop() {
 	if p.stopped.Swap(true) {
 		return
 	}
+	p.isStreaming.Store(false)
 	close(p.quit)
 
 	p.pauseMu.Lock()
