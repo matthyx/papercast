@@ -104,28 +104,56 @@ func NewNativePipeline(sessionProvider SessionProvider, fps int, qp int) *Native
 
 func (p *NativePipeline) watchdogLoop() {
 	ticker := time.NewTicker(200 * time.Millisecond)
-	statsTicker := time.NewTicker(5 * time.Second)
+	statsTicker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	defer statsTicker.Stop()
 
-	var lastLoggedFrames uint64
-	lastLoggedTime := time.Now()
+	var (
+		lastLoggedFrames uint64
+		lastLoggedTime   = time.Now()
+		hasLoggedHealthy bool
+		hasLoggedZero    bool
+	)
 
 	for {
 		select {
 		case <-p.quit:
 			return
 		case <-statsTicker.C:
-			if p.isStreaming.Load() {
-				total := atomic.LoadUint64(&p.totalFrames)
-				elapsed := time.Since(lastLoggedTime).Seconds()
-				if elapsed > 0 {
-					fps := float64(total-lastLoggedFrames) / elapsed
-					log.Printf("[native] Stream healthy: %.1f FPS (%d total frames)", fps, total)
-				}
-				lastLoggedFrames = total
+			if !p.isStreaming.Load() {
+				hasLoggedHealthy = false
+				hasLoggedZero = false
 				lastLoggedTime = time.Now()
+				lastLoggedFrames = atomic.LoadUint64(&p.totalFrames)
+				continue
 			}
+
+			total := atomic.LoadUint64(&p.totalFrames)
+			elapsed := time.Since(lastLoggedTime).Seconds()
+			if elapsed <= 0 {
+				continue
+			}
+			fps := float64(total-lastLoggedFrames) / elapsed
+
+			if !hasLoggedHealthy {
+				if fps > 0 {
+					log.Printf("[native] Stream healthy: %.1f FPS", fps)
+					hasLoggedHealthy = true
+					hasLoggedZero = false
+				}
+			} else {
+				if fps == 0 && !hasLoggedZero {
+					log.Printf("[native] Warning: Stream FPS dropped to 0 (no new frames generated)")
+					hasLoggedZero = true
+				} else if fps > 0 && hasLoggedZero {
+					log.Printf("[native] Stream resumed: %.1f FPS", fps)
+					hasLoggedZero = false
+				}
+			}
+
+			lastLoggedFrames = total
+			lastLoggedTime = time.Now()
+
 		case <-ticker.C:
 			if p.stopped.Load() {
 				return
