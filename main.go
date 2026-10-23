@@ -30,6 +30,7 @@ func main() {
 	cursorMode := flag.Uint("cursor", uint(portal.CursorModeEmbedded), "Cursor mode (1: hidden, 2: embedded)")
 	autoOpen := flag.Bool("open", false, "Automatically open Chrome on connected Android tablet")
 	testMode := flag.Bool("test", false, "Run in test mode with synthetic video pattern (no desktop screen authorization needed)")
+	useGst := flag.Bool("gst", false, "Use legacy GStreamer capture pipeline instead of native libpipewire")
 	showVersion := flag.Bool("version", false, "Print Papercast version")
 	flag.Parse()
 
@@ -54,11 +55,17 @@ func main() {
 		}
 	}()
 
-	var pipeline *capture.Pipeline
+	type streamPipeline interface {
+		Start(onFrame func(frame []byte, isKey bool)) error
+		Stop()
+	}
+
+	var pipeline streamPipeline
 	if *testMode {
-		log.Printf("[capture] Running in autonomous test mode with SMPTE test pattern")
+		log.Printf("[capture] Running in autonomous test mode with SMPTE test pattern (GStreamer)")
 		pipeline = capture.NewPipeline(nil, *fps, *bitrate, *qp)
-	} else {
+	} else if *useGst {
+		log.Printf("[capture] Using legacy GStreamer capture pipeline")
 		var (
 			currentSession *portal.Session
 			sessMu         sync.Mutex
@@ -68,13 +75,11 @@ func main() {
 			sessMu.Lock()
 			defer sessMu.Unlock()
 
-			// Close old session if any, ensuring previous stream node is cleaned up
 			if currentSession != nil {
 				_ = currentSession.Close()
 				currentSession = nil
 			}
 
-			// Acquire live ScreenCast session via restore token (instant, headless, no prompt)
 			log.Printf("[portal] Acquiring fresh ScreenCast session via restore token...")
 			sess, err := portal.RequestScreenCast(uint32(*cursorMode), 10*time.Second)
 			if err != nil {
@@ -98,9 +103,24 @@ func main() {
 		}()
 
 		pipeline = capture.NewPipeline(sessionProvider, *fps, *bitrate, *qp)
+	} else {
+		// Native libpipewire + hardware VA-API capture engine (default)
+		log.Printf("[capture] Initializing native libpipewire + VA-API zero-latency capture engine...")
+		sess, err := portal.RequestScreenCast(uint32(*cursorMode), 10*time.Second)
+		if err != nil {
+			log.Fatalf("[portal] Portal authorization error: %v", err)
+		}
+		defer sess.Close()
+
+		pwFile, err := sess.OpenPipeWireRemote()
+		if err != nil {
+			log.Fatalf("[portal] OpenPipeWireRemote error: %v", err)
+		}
+
+		pipeline = capture.NewNativePipeline(pwFile, sess.NodeID, *fps, *qp)
 	}
 
-	// 4. Start GStreamer capture & encoding pipeline
+	// 4. Start capture & encoding pipeline
 	err := pipeline.Start(func(frame []byte, isKey bool) {
 		srv.BroadcastFrame(frame, isKey)
 	})

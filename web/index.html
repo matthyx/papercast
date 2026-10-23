@@ -178,81 +178,76 @@
             return false;
         }
 
-        async function initDecoder() {
-            if (!('VideoDecoder' in window)) {
-                statusEl.textContent = "Error: WebCodecs VideoDecoder API not supported in this browser.";
-                return false;
-            }
+        const decoderConfig = {
+            codec: "avc1.42E028", // Constrained Baseline Profile, Level 4.0
+            avc: { format: "annexb" },
+            optimizeForLatency: true,
+            hardwareAcceleration: "prefer-hardware"
+        };
 
-            if (decoder && decoder.state !== "closed") {
+        function configureDecoder() {
+            if (decoder) {
                 try { decoder.close(); } catch(e) {}
             }
-
-            decoder = new VideoDecoder({
-                output: (frame) => {
-                    try {
-                        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-                            canvas.width = frame.displayWidth;
-                            canvas.height = frame.displayHeight;
-                        }
-                        ctx.drawImage(frame, 0, 0);
-                    } catch (drawErr) {
-                        console.warn("Draw frame error:", drawErr);
-                    } finally {
-                        frame.close();
-                    }
-
-                    frameCount++;
-                    let now = performance.now();
-                    if (now - lastFpsTime >= 1000) {
-                        fps = Math.round((frameCount * 1000) / (now - lastFpsTime));
-                        statsEl.textContent = `FPS: ${fps} | WebCodecs HW`;
-                        frameCount = 0;
-                        lastFpsTime = now;
-                    }
-                    if (!statusEl.classList.contains("hide")) {
-                        statusEl.classList.add("hide");
-                    }
-                },
-                error: (e) => {
-                    console.error("VideoDecoder error:", e);
-                    hasReceivedKeyframe = false;
-                    initDecoder();
-                }
-            });
-
-            // Annex-B byte stream config for WebCodecs
-            const config = {
-                codec: "avc1.42E028", // Constrained Baseline Profile, Level 4.0
-                avc: { format: "annexb" },
-                optimizeForLatency: true,
-                hardwareAcceleration: "prefer-hardware"
-            };
-
             try {
-                const support = await VideoDecoder.isConfigSupported(config);
-                if (support.supported) {
-                    decoder.configure(config);
-                    return true;
-                }
-            } catch (e) {
-                console.warn("Config test failed, falling back:", e);
-            }
+                decoder = new VideoDecoder({
+                    output: (frame) => {
+                        try {
+                            if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+                                canvas.width = frame.displayWidth;
+                                canvas.height = frame.displayHeight;
+                            }
+                            ctx.drawImage(frame, 0, 0);
+                        } catch (drawErr) {
+                            console.warn("Draw frame error:", drawErr);
+                        } finally {
+                            frame.close();
+                        }
 
-            // Fallback config without explicit annexb property
-            decoder.configure({
-                codec: "avc1.420028",
-                optimizeForLatency: true
-            });
-            return true;
+                        frameCount++;
+                        let now = performance.now();
+                        if (now - lastFpsTime >= 1000) {
+                            fps = Math.round((frameCount * 1000) / (now - lastFpsTime));
+                            statsEl.textContent = `FPS: ${fps} | WebCodecs HW`;
+                            frameCount = 0;
+                            lastFpsTime = now;
+                        }
+                        if (!statusEl.classList.contains("hide")) {
+                            statusEl.classList.add("hide");
+                        }
+                    },
+                    error: (e) => {
+                        console.error("VideoDecoder error:", e);
+                        hasReceivedKeyframe = false;
+                        try {
+                            decoder.reset();
+                            decoder.configure(decoderConfig);
+                        } catch(resetErr) {
+                            configureDecoder();
+                        }
+                    }
+                });
+                decoder.configure(decoderConfig);
+                return true;
+            } catch (err) {
+                console.error("Decoder configuration failed:", err);
+                return false;
+            }
         }
 
         async function connect() {
+            if (!('VideoDecoder' in window)) {
+                statusEl.textContent = "Error: WebCodecs VideoDecoder API not supported in this browser.";
+                return;
+            }
+
             statusEl.textContent = "Initializing WebCodecs...";
             statusEl.classList.remove("hide");
 
-            const ok = await initDecoder();
-            if (!ok) return;
+            if (!configureDecoder()) {
+                statusEl.textContent = "Error: Failed to configure hardware video decoder.";
+                return;
+            }
 
             requestWakeLock();
             hasReceivedKeyframe = false;
@@ -283,35 +278,45 @@
                 const u8 = new Uint8Array(event.data);
                 const isKey = isKeyframe(u8);
 
-                if (!hasReceivedKeyframe) {
-                    if (!isKey) {
-                        // Drop delta frames until first keyframe containing SPS/PPS arrives
-                        return;
-                    }
-                    hasReceivedKeyframe = true;
+                // If waiting for keyframe and this is not a keyframe, drop it
+                if (!hasReceivedKeyframe && !isKey) {
+                    return;
                 }
 
-                if (decoder && decoder.state === "configured") {
-                    if (decoder.decodeQueueSize > 8 && !isKey) {
-                        // Hardware decoder backlog: drop remaining GOP until next keyframe
-                        // to prevent missing reference frame freezes.
+                // Ensure decoder is configured
+                if (!decoder || decoder.state !== "configured") {
+                    configureDecoder();
+                    if (!isKey) {
                         hasReceivedKeyframe = false;
                         return;
                     }
-                    try {
-                        const chunk = new EncodedVideoChunk({
-                            type: isKey ? "key" : "delta",
-                            timestamp: performance.now() * 1000,
-                            data: u8
-                        });
-                        decoder.decode(chunk);
-                    } catch (err) {
-                        console.warn("Decode chunk error:", err);
-                        hasReceivedKeyframe = false;
-                        initDecoder();
+                }
+
+                // Drop delta frames if hardware decoder queue backs up
+                if (decoder.decodeQueueSize > 8 && !isKey) {
+                    hasReceivedKeyframe = false;
+                    return;
+                }
+
+                try {
+                    const chunk = new EncodedVideoChunk({
+                        type: isKey ? "key" : "delta",
+                        timestamp: performance.now() * 1000,
+                        data: u8
+                    });
+                    decoder.decode(chunk);
+                    if (isKey) {
+                        hasReceivedKeyframe = true;
                     }
-                } else if (!decoder || decoder.state === "closed") {
-                    initDecoder();
+                } catch (err) {
+                    console.warn("Decode chunk error:", err);
+                    hasReceivedKeyframe = false;
+                    try {
+                        decoder.reset();
+                        decoder.configure(decoderConfig);
+                    } catch(resetErr) {
+                        configureDecoder();
+                    }
                 }
             };
 
