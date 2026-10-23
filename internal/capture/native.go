@@ -55,7 +55,7 @@ type NativePipeline struct {
 	cCap            *C.native_capture_t
 	onFrame         func(frame []byte, isKey bool)
 	mu              sync.Mutex
-	stopped         bool
+	stopped         atomic.Bool
 
 	pauseMu    sync.Mutex
 	pauseTimer *time.Timer
@@ -89,7 +89,16 @@ func NewNativePipeline(sessionProvider SessionProvider, fps int, qp int) *Native
 }
 
 func (p *NativePipeline) handleStateChange(oldState, newState int) {
-	// PipeWire states: -1 = ERROR, 0 = UNCONNECTED, 1 = CONNECTING, 2 = PAUSED, 3 = STREAMING
+	// PipeWire states:
+	// -1 = PW_STREAM_STATE_ERROR
+	//  0 = PW_STREAM_STATE_UNCONNECTED
+	//  1 = PW_STREAM_STATE_CONNECTING
+	//  2 = PW_STREAM_STATE_PAUSED
+	//  3 = PW_STREAM_STATE_STREAMING
+	if p.stopped.Load() {
+		return
+	}
+
 	p.pauseMu.Lock()
 	defer p.pauseMu.Unlock()
 
@@ -102,8 +111,14 @@ func (p *NativePipeline) handleStateChange(oldState, newState int) {
 		return
 	}
 
-	if newState <= 1 {
-		// Fatal loss of PipeWire connection or portal node destroyed -> revive immediately
+	// Initial connection phases: unconnected (0) -> connecting (1) -> paused (2)
+	// Do not trigger revive during initial startup
+	if oldState <= 1 && (newState == 1 || newState == 2) {
+		return
+	}
+
+	// Fatal loss of active stream (was paused/streaming and now errored or disconnected)
+	if oldState >= 2 && (newState == -1 || newState == 0) {
 		if p.pauseTimer != nil {
 			p.pauseTimer.Stop()
 			p.pauseTimer = nil
@@ -117,11 +132,11 @@ func (p *NativePipeline) handleStateChange(oldState, newState int) {
 
 	if oldState == 3 && newState == 2 {
 		// Stream paused by compositor (e.g. fullscreen transition or direct scanout switch).
-		// Wait 100ms: if stream doesn't resume on its own, trigger revive.
+		// Wait 150ms: if stream doesn't resume on its own, trigger revive.
 		if p.pauseTimer != nil {
 			p.pauseTimer.Stop()
 		}
-		p.pauseTimer = time.AfterFunc(100*time.Millisecond, func() {
+		p.pauseTimer = time.AfterFunc(150*time.Millisecond, func() {
 			select {
 			case p.reviveChan <- struct{}{}:
 			default:
@@ -136,8 +151,12 @@ func (p *NativePipeline) supervisorLoop() {
 		case <-p.quit:
 			return
 		case <-p.reviveChan:
+			if p.stopped.Load() {
+				return
+			}
+
 			p.mu.Lock()
-			if p.stopped {
+			if p.stopped.Load() {
 				p.mu.Unlock()
 				return
 			}
@@ -197,7 +216,7 @@ func (p *NativePipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 	defer p.mu.Unlock()
 
 	p.onFrame = onFrame
-	p.stopped = false
+	p.stopped.Store(false)
 
 	if p.sessionProvider != nil && p.pwFile == nil {
 		pwFile, nodeID, err := p.sessionProvider()
@@ -235,13 +254,9 @@ func (p *NativePipeline) Start(onFrame func(frame []byte, isKey bool)) error {
 
 // Stop gracefully shuts down the capture pipeline.
 func (p *NativePipeline) Stop() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.stopped {
+	if p.stopped.Swap(true) {
 		return
 	}
-	p.stopped = true
 	close(p.quit)
 
 	p.pauseMu.Lock()
@@ -250,6 +265,9 @@ func (p *NativePipeline) Stop() {
 		p.pauseTimer = nil
 	}
 	p.pauseMu.Unlock()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	if p.cCap != nil {
 		C.native_capture_stop(p.cCap)
