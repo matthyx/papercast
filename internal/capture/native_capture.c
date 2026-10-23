@@ -281,12 +281,14 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
     cap->has_format = true;
 
     // Acknowledge parameters and request buffers (support both MemPtr and MemFd)
+    // Enforce strict double-buffering (min 1, default 2, max 2) so xdg-desktop-portal-cosmic
+    // never queues concurrent create_frame requests that violate ext_image_copy_capture_v1 protocol.
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     const struct spa_pod *params[1];
     params[0] = spa_pod_builder_add_object(&b,
         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-        SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
+        SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(2, 1, 2),
         SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
         SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int((1<<SPA_DATA_MemPtr) | (1<<SPA_DATA_MemFd))
     );
