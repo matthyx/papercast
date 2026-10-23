@@ -210,16 +210,15 @@ func (p *NativePipeline) handleStateChange(oldState, newState int) {
 		}
 		return
 	}
-	p.isStreaming.Store(false)
 
-	// Initial connection phases: unconnected (0) -> connecting (1) -> paused (2)
-	// Do not trigger revive during initial startup
-	if oldState <= 1 && (newState == 1 || newState == 2) {
+	// If we were not actively streaming, ignore secondary teardown or intermediate disconnect events
+	wasStreaming := p.isStreaming.Swap(false)
+	if !wasStreaming {
 		return
 	}
 
-	// Fatal loss of active stream (was paused/streaming and now errored or disconnected)
-	if oldState >= 2 && (newState == -1 || newState == 0) {
+	// Fatal loss of active stream (was streaming and now errored or disconnected)
+	if newState == -1 || newState == 0 {
 		if p.pauseTimer != nil {
 			p.pauseTimer.Stop()
 			p.pauseTimer = nil
@@ -329,6 +328,20 @@ func (p *NativePipeline) supervisorLoop() {
 				p.cCap = cCap
 				log.Printf("[native] Successfully revived native capture on node %d", p.nodeID)
 			}
+
+			// Drain any pending revive tokens that queued during teardown and reconnection
+			for len(p.reviveChan) > 0 {
+				select {
+				case <-p.reviveChan:
+				default:
+				}
+			}
+			p.pauseMu.Lock()
+			if p.pauseTimer != nil {
+				p.pauseTimer.Stop()
+				p.pauseTimer = nil
+			}
+			p.pauseMu.Unlock()
 			p.mu.Unlock()
 		}
 	}
