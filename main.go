@@ -25,12 +25,9 @@ func main() {
 	host := flag.String("host", "0.0.0.0", "Host address to bind HTTP/WebSocket server")
 	port := flag.Int("port", 1701, "Port to serve on")
 	fps := flag.Int("fps", 30, "Target capture framerate")
-	bitrate := flag.Int("bitrate", 3000, "Encoding bitrate in kbps")
 	qp := flag.Int("qp", 26, "VA-API Quantization Parameter (lower = higher quality, higher = lower bitrate, default 26)")
 	cursorMode := flag.Uint("cursor", uint(portal.CursorModeEmbedded), "Cursor mode (1: hidden, 2: embedded)")
 	autoOpen := flag.Bool("open", false, "Automatically open Chrome on connected Android tablet")
-	testMode := flag.Bool("test", false, "Run in test mode with synthetic video pattern (no desktop screen authorization needed)")
-	useGst := flag.Bool("gst", false, "Use legacy GStreamer capture pipeline instead of native libpipewire")
 	showVersion := flag.Bool("version", false, "Print Papercast version")
 	flag.Parse()
 
@@ -54,11 +51,6 @@ func main() {
 			log.Fatalf("[server] Fatal server error: %v", err)
 		}
 	}()
-
-	type streamPipeline interface {
-		Start(onFrame func(frame []byte, isKey bool)) error
-		Stop()
-	}
 
 	var (
 		currentSession *portal.Session
@@ -96,20 +88,9 @@ func main() {
 		sessMu.Unlock()
 	}()
 
-	var pipeline streamPipeline
-	if *testMode {
-		log.Printf("[capture] Running in autonomous test mode with SMPTE test pattern (GStreamer)")
-		pipeline = capture.NewPipeline(nil, *fps, *bitrate, *qp)
-	} else if *useGst {
-		log.Printf("[capture] Using legacy GStreamer capture pipeline")
-		pipeline = capture.NewPipeline(sessionProvider, *fps, *bitrate, *qp)
-	} else {
-		// Native libpipewire + hardware VA-API capture engine (default)
-		log.Printf("[capture] Initializing native libpipewire + VA-API zero-latency capture engine...")
-		pipeline = capture.NewNativePipeline(sessionProvider, *fps, *qp)
-	}
-
-	// 4. Start capture & encoding pipeline
+	// 3. Start native capture & encoding pipeline (libpipewire + VA-API)
+	log.Printf("[capture] Initializing native libpipewire + VA-API zero-latency capture engine...")
+	pipeline := capture.NewPipeline(sessionProvider, *fps, *qp)
 	err := pipeline.Start(func(frame []byte, isKey bool) {
 		srv.BroadcastFrame(frame, isKey)
 	})

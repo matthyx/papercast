@@ -52,8 +52,12 @@ func goOnNativeState(oldState C.int, newState C.int, goHandle C.uintptr_t) {
 	pipeline.handleStateChange(int(oldState), int(newState))
 }
 
-// NativePipeline manages direct PipeWire stream capture and hardware VA-API encoding without GStreamer.
-type NativePipeline struct {
+// SessionProvider provides a live PipeWire remote file and node ID.
+// If the session died (e.g. portal crash), it re-acquires a valid session seamlessly.
+type SessionProvider func() (*os.File, uint32, error)
+
+// Pipeline manages direct PipeWire stream capture and hardware VA-API encoding.
+type Pipeline struct {
 	sessionProvider   SessionProvider
 	pwFile            *os.File
 	nodeID            uint32
@@ -74,8 +78,11 @@ type NativePipeline struct {
 	quit       chan struct{}
 }
 
-// NewNativePipeline creates a new native capture pipeline using libpipewire and libavcodec.
-func NewNativePipeline(sessionProvider SessionProvider, fps int, qp int) *NativePipeline {
+// NativePipeline is kept as an alias for backwards compatibility.
+type NativePipeline = Pipeline
+
+// NewPipeline creates a new native capture pipeline using libpipewire and libavcodec.
+func NewPipeline(sessionProvider SessionProvider, fps int, qp int) *Pipeline {
 	if qp <= 0 {
 		qp = 26
 	}
@@ -83,7 +90,7 @@ func NewNativePipeline(sessionProvider SessionProvider, fps int, qp int) *Native
 		fps = 30
 	}
 	handle := atomic.AddUintptr(&nativeHandleSeq, 1)
-	p := &NativePipeline{
+	p := &Pipeline{
 		sessionProvider: sessionProvider,
 		fps:             fps,
 		qp:              qp,
@@ -100,6 +107,11 @@ func NewNativePipeline(sessionProvider SessionProvider, fps int, qp int) *Native
 	go p.watchdogLoop()
 
 	return p
+}
+
+// NewNativePipeline is kept as an alias for backwards compatibility.
+func NewNativePipeline(sessionProvider SessionProvider, fps int, qp int) *Pipeline {
+	return NewPipeline(sessionProvider, fps, qp)
 }
 
 func (p *NativePipeline) watchdogLoop() {

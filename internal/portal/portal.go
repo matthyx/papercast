@@ -31,7 +31,7 @@ type Session struct {
 }
 
 // OpenPipeWireRemote opens a new PipeWire remote file descriptor on the active session.
-// This can be called repeatedly to revive GStreamer pipelines without prompting the user.
+// This can be called repeatedly to revive capture pipelines without prompting the user.
 func (s *Session) OpenPipeWireRemote() (*os.File, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

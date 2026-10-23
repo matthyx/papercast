@@ -11,7 +11,7 @@ Written in **Go** with a high-performance native `libpipewire-0.3` + hardware VA
 Existing desktop streamers (like Weylus or Deskreen) suffer from severe input lag and high CPU usage on low-power ARM tablets (like Rockchip RK3566 / Cortex-A55 devices):
 
 * **Direct Hardware WebCodecs (Sub-15ms Latency)**: Traditional tools stream fragmented MP4 files into HTML5 `<video>` tags via `MediaSource`, which enforces a 3–5 frame jitter buffer (~100–150ms of artificial latency). Papercast feeds raw H.264 Annex-B Access Units directly into Chrome's **WebCodecs hardware decoder** (`VideoDecoder`), rendering straight to `<canvas>` with zero browser buffer delay.
-* **Native PipeWire & VA-API Engine**: Captures directly from PipeWire using `libpipewire-0.3` and encodes with Intel VA-API (`h264_vaapi`) in hardware (~1ms per frame), bypassing GStreamer design flaws on Wayland Direct Scanout. Automatic fallback to software `libx264 ultrafast` if hardware encoding is unavailable.
+* **Native PipeWire & VA-API Engine**: Captures directly from PipeWire using `libpipewire-0.3` and encodes with Intel VA-API (`h264_vaapi`) in hardware (~1ms per frame) with zero external process dependencies. Automatic fallback to software `libx264 ultrafast` if hardware encoding is unavailable.
 * **Headless ScreenCast via Persistent Restore Tokens**: Authorize screen sharing once via the desktop portal dialog. Papercast permanently saves a cryptographically secure restore token (`~/.config/papercast/restore_token`). Subsequent launches start **headlessly with zero screen-picker prompts**.
 * **Self-Healing Supervisor Loop**: Pop!_OS COSMIC and other Wayland compositors often reset screencast nodes during fullscreen toggling (e.g. YouTube fullscreen) or mode switches. Papercast's supervisor detects node detaches via PipeWire registry events and revives the session headlessly in **<100ms** without freezing the tablet.
 * **Synchronous Atomic WebCodecs Decoder**: Android's `MediaCodec` pipeline crashes when fed delta frames while an async decoder configuration is in flight. Papercast's client uses synchronous decoder resets and keyframe-gated decoding, ensuring glitch-free playback through dynamic resolution switches.
@@ -76,16 +76,10 @@ Usage of papercast:
         Target capture framerate (default: 30)
   -qp int
         VA-API Quantization Parameter: lower = higher quality, higher = lower bitrate (default: 26)
-  -bitrate int
-        Encoding bitrate in kbps for software fallback (default: 3000)
   -cursor uint
         Cursor mode: 1 = Hidden, 2 = Embedded (default: 2)
   -open
         Automatically launch Chrome on connected Android tablet via ADB
-  -test
-        Run in autonomous test mode with synthetic SMPTE pattern (no desktop screen authorization needed)
-  -gst
-        Use legacy GStreamer capture pipeline instead of native libpipewire
   -version
         Print Papercast version
 ```
