@@ -85,12 +85,93 @@ func (s *Session) Close() error {
 	return nil
 }
 
+var (
+	targetOutputMu sync.RWMutex
+	targetOutput   string
+)
+
+// SetTargetOutput configures the portal client to target a specific display output (e.g., "HDMI-A-1").
+// When set on COSMIC desktop, Papercast automatically provisions a headless restore token for that output.
+func SetTargetOutput(output string) {
+	targetOutputMu.Lock()
+	targetOutput = strings.TrimSpace(output)
+	targetOutputMu.Unlock()
+}
+
+func getTargetOutput() string {
+	targetOutputMu.RLock()
+	defer targetOutputMu.RUnlock()
+	return targetOutput
+}
+
 func getRestoreTokenPath() string {
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return ""
 	}
+	out := getTargetOutput()
+	if out != "" {
+		return filepath.Join(configDir, "papercast", "restore_token_"+out)
+	}
 	return filepath.Join(configDir, "papercast", "restore_token")
+}
+
+type cosmicRestoreInner struct {
+	Outputs []string
+	Windows []string
+}
+
+type cosmicRestoreData struct {
+	Vendor  string
+	Version uint32
+	Data    dbus.Variant
+}
+
+// ensureOutputRestoreToken ensures that a valid restore token exists in the XDG PermissionStore
+// pointing directly to the requested COSMIC display output (e.g. "HDMI-A-1"), avoiding any GUI picker.
+func ensureOutputRestoreToken(conn *dbus.Conn, output string) string {
+	if output == "" {
+		return loadRestoreToken()
+	}
+
+	token := loadRestoreToken()
+	if token == "" {
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		token = fmt.Sprintf("%08x-%04x-4%03x-8%03x-%012x",
+			r.Uint32(), r.Intn(0xffff), r.Intn(0x0fff), r.Intn(0x0fff), r.Int63n(0xffffffffffff))
+	}
+
+	permStore := conn.Object("org.freedesktop.impl.portal.PermissionStore", "/org/freedesktop/impl/portal/PermissionStore")
+	appPerms := map[string][]string{
+		"":                             {"yes"},
+		"com.system76.CosmicAppList": {"yes"},
+	}
+	inner := cosmicRestoreInner{
+		Outputs: []string{output},
+		Windows: []string{},
+	}
+	outer := cosmicRestoreData{
+		Vendor:  "COSMIC",
+		Version: 1,
+		Data:    dbus.MakeVariant(inner),
+	}
+
+	err := permStore.Call(
+		"org.freedesktop.impl.portal.PermissionStore.Set",
+		0,
+		"screencast",
+		true,
+		token,
+		appPerms,
+		dbus.MakeVariant(outer),
+	).Err
+	if err != nil {
+		log.Printf("[portal] Note: could not pre-seed PermissionStore for %s: %v", output, err)
+		return loadRestoreToken()
+	}
+
+	saveRestoreToken(token)
+	return token
 }
 
 func loadRestoreToken() string {
@@ -189,7 +270,7 @@ func RequestScreenCast(cursorMode uint32, timeout time.Duration) (*Session, erro
 	// 2. SelectSources
 	token2 := fmt.Sprintf("t_%d", r.Intn(900000)+100000)
 	var selectReqPath dbus.ObjectPath
-	restoreToken := loadRestoreToken()
+	restoreToken := ensureOutputRestoreToken(conn, getTargetOutput())
 
 	selectOpts := map[string]dbus.Variant{
 		"handle_token": dbus.MakeVariant(token2),

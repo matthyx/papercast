@@ -208,7 +208,7 @@
                         let now = performance.now();
                         if (now - lastFpsTime >= 1000) {
                             fps = Math.round((frameCount * 1000) / (now - lastFpsTime));
-                            statsEl.textContent = `FPS: ${fps} | WebCodecs HW`;
+                            statsEl.textContent = `FPS: ${fps} | ${canvas.width}x${canvas.height} | WebCodecs HW`;
                             frameCount = 0;
                             lastFpsTime = now;
                         }

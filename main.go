@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -15,11 +17,25 @@ import (
 	"github.com/matthyx/papercast/internal/capture"
 	"github.com/matthyx/papercast/internal/portal"
 	"github.com/matthyx/papercast/internal/server"
+	"github.com/matthyx/papercast/internal/vdisplay"
 )
 
 var (
-	version = "0.1.0"
+	version = "0.2.0"
 )
+
+func parseResolution(res string) (int, int, error) {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(res)), "x")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid resolution %q (expected WIDTHxHEIGHT, e.g. 1600x1200)", res)
+	}
+	w, err1 := strconv.Atoi(parts[0])
+	h, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || w <= 0 || h <= 0 {
+		return 0, 0, fmt.Errorf("invalid resolution dimensions %q", res)
+	}
+	return w, h, nil
+}
 
 func main() {
 	host := flag.String("host", "0.0.0.0", "Host address to bind HTTP/WebSocket server")
@@ -27,6 +43,11 @@ func main() {
 	fps := flag.Int("fps", 30, "Target capture framerate")
 	qp := flag.Int("qp", 26, "VA-API Quantization Parameter (lower = higher quality, higher = lower bitrate, default 26)")
 	cursorMode := flag.Uint("cursor", uint(portal.CursorModeEmbedded), "Cursor mode (1: hidden, 2: embedded)")
+	virtual := flag.Bool("virtual", true, "Create a dedicated virtual display at native tablet resolution (use -virtual=false to mirror existing display)")
+	res := flag.String("res", "1600x1200", "Virtual display resolution (1600x1200 landscape or 1200x1600 portrait)")
+	scale := flag.Float64("scale", 1.25, "Pixel scale factor for virtual display (e.g. 1.25 or 1.5 for larger fonts)")
+	output := flag.String("output", "", "Specific display output to capture (e.g. eDP-1, DP-2, HDMI-A-1)")
+	mirrorOn := flag.String("mirror-on", "", "Mirror the virtual display onto a physical output (e.g. eDP-1)")
 	autoOpen := flag.Bool("open", false, "Automatically open Chrome on connected Android tablet")
 	showVersion := flag.Bool("version", false, "Print Papercast version")
 	flag.Parse()
@@ -43,7 +64,38 @@ func main() {
 		log.Printf("[adb] Warning: %v", err)
 	}
 
-	// 2. Start Web & WebSocket server
+	// 2. Provision hardware-accelerated virtual display if enabled
+	var vdisp *vdisplay.VirtualDisplay
+	targetOut := strings.TrimSpace(*output)
+
+	if *virtual {
+		w, h, err := parseResolution(*res)
+		if err != nil {
+			log.Fatalf("[vdisplay] %v", err)
+		}
+		vdisp, err = vdisplay.Enable(vdisplay.Config{
+			Connector: targetOut,
+			Width:     w,
+			Height:    h,
+			Scale:     *scale,
+			MirrorOn:  strings.TrimSpace(*mirrorOn),
+		})
+		if err != nil {
+			log.Printf("[vdisplay] Warning: could not create virtual display (%v); falling back to existing screen", err)
+		} else {
+			targetOut = vdisp.Connector
+			defer func() {
+				_ = vdisp.Close()
+			}()
+		}
+	}
+
+	if targetOut != "" {
+		portal.SetTargetOutput(targetOut)
+		log.Printf("[portal] Targeting display output: %s", targetOut)
+	}
+
+	// 3. Start Web & WebSocket server
 	addr := fmt.Sprintf("%s:%d", *host, *port)
 	srv := server.NewServer(addr)
 	go func() {
@@ -88,13 +140,16 @@ func main() {
 		sessMu.Unlock()
 	}()
 
-	// 3. Start native capture & encoding pipeline (libpipewire + VA-API)
+	// 4. Start native capture & encoding pipeline (libpipewire + VA-API)
 	log.Printf("[capture] Initializing native libpipewire + VA-API zero-latency capture engine...")
 	pipeline := capture.NewPipeline(sessionProvider, *fps, *qp)
 	err := pipeline.Start(func(frame []byte, isKey bool) {
 		srv.BroadcastFrame(frame, isKey)
 	})
 	if err != nil {
+		if vdisp != nil {
+			_ = vdisp.Close()
+		}
 		log.Fatalf("[capture] Pipeline error: %v", err)
 	}
 	defer pipeline.Stop()
@@ -116,6 +171,9 @@ func main() {
 
 	log.Printf("\n[papercast] Shutting down...")
 	pipeline.Stop()
+	if vdisp != nil {
+		_ = vdisp.Close()
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

@@ -18,11 +18,11 @@ func SetupReverseForwarding(port int) error {
 
 	lines := strings.Split(string(out), "\n")
 	hasDevice := false
-	for _, line := range lines[1:] {
-		line = strings.TrimSpace(line)
-		if line != "" && strings.Contains(line, "device") && !strings.Contains(line, "offline") {
+	for _, line := range lines {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 2 && fields[1] == "device" {
 			hasDevice = true
-			log.Printf("[adb] Detected connected Android device: %s", strings.Fields(line)[0])
+			log.Printf("[adb] Detected connected Android device: %s", fields[0])
 			break
 		}
 	}
