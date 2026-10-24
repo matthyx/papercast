@@ -12,7 +12,7 @@ Existing desktop streamers (like Weylus or Deskreen) suffer from severe input la
 
 * **Direct Hardware WebCodecs (Sub-15ms Latency)**: Traditional tools stream fragmented MP4 files into HTML5 `<video>` tags via `MediaSource`, which enforces a 3–5 frame jitter buffer (~100–150ms of artificial latency). Papercast feeds raw H.264 Annex-B Access Units directly into Chrome's **WebCodecs hardware decoder** (`VideoDecoder`), rendering straight to `<canvas>` with zero browser buffer delay.
 * **Native PipeWire & VA-API Engine**: Captures directly from PipeWire using `libpipewire-0.3` and encodes with Intel VA-API (`h264_vaapi`) in hardware (~1ms per frame) with zero external process dependencies. Automatic fallback to software `libx264 ultrafast` if hardware encoding is unavailable.
-* **Hardware-Accelerated 4:3 Virtual Display (`1600x1200`)**: Automatically provisions a dedicated virtual display on an unused Intel DRM/KMS connector with a custom EDID (`1600x1200` landscape or `1200x1600` portrait @ 60Hz) and independent HiDPI scaling (`-scale 1.25` or `1.5`), filling 100% of the HannsNote2 screen with crisp, readable fonts and zero black bars. Automatically disconnects on exit.
+* **Hardware-Accelerated Virtual Display (Auto-Resolution)**: Automatically detects the connected Android tablet's native resolution via `adb shell wm size` (falling back to `1600x1200`) and provisions a dedicated virtual display on an unused Intel DRM/KMS connector with a custom EDID and independent HiDPI scaling (`-scale 1.25` or `1.5`), filling 100% of the tablet screen with crisp, readable fonts and zero black bars. Automatically disconnects on exit.
 * **Headless ScreenCast via Persistent Restore Tokens**: Pre-seeds the XDG `PermissionStore` and permanently saves restore tokens (`~/.config/papercast/restore_token*`). Launches **100% headlessly with zero screen-picker prompts**.
 * **Self-Healing Supervisor Loop**: Pop!_OS COSMIC and other Wayland compositors often reset screencast nodes during fullscreen toggling (e.g. YouTube fullscreen) or mode switches. Papercast's supervisor detects node detaches via PipeWire registry events and revives the session headlessly in **<100ms** without freezing the tablet.
 * **Synchronous Atomic WebCodecs Decoder**: Android's `MediaCodec` pipeline crashes when fed delta frames while an async decoder configuration is in flight. Papercast's client uses synchronous decoder resets and keyframe-gated decoding, ensuring glitch-free playback through dynamic resolution switches.
@@ -80,7 +80,7 @@ Usage of papercast:
   -virtual
         Create a dedicated virtual display at native tablet resolution (default: true; pass -virtual=false to mirror existing display)
   -res string
-        Virtual display resolution: 1600x1200 landscape or 1200x1600 portrait (default: "1600x1200")
+        Virtual display resolution: auto (via adb shell wm size), or WIDTHxHEIGHT e.g. 1600x1200, 1200x1600 (default: "auto")
   -scale float
         Pixel scale factor for virtual display, e.g. 1.25 or 1.5 for larger fonts (default: 1.25)
   -output string

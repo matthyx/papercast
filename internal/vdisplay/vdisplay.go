@@ -69,9 +69,14 @@ func BuildEDID(width, height int) []byte {
 	// Digital input, 8 bits per color, DisplayPort/HDMI compliant
 	edid[20] = 0xa5
 
-	// Physical size: 20 cm x 15 cm (10-inch 4:3 RLCD panel)
-	edid[21] = 20
-	edid[22] = 15
+	// Physical size in cm/mm proportional to resolution (~200mm on the major axis)
+	wMM := 200
+	hMM := (200 * height) / width
+	if hMM <= 0 {
+		hMM = 150
+	}
+	edid[21] = byte(wMM / 10)
+	edid[22] = byte(hMM / 10)
 
 	// Gamma 2.2 ((2.2 * 100) - 100 = 120)
 	edid[23] = 120
@@ -92,17 +97,17 @@ func BuildEDID(width, height int) []byte {
 	}
 
 	// Detailed Timing Descriptor 1 (Preferred): width x height @ 60Hz
-	dtd1 := makeDTD(width, height, 60, 200, 150)
+	dtd1 := makeDTD(width, height, 60, wMM, hMM)
 	copy(edid[54:72], dtd1)
 
 	// Detailed Timing Descriptor 2 (Rotated): height x width @ 60Hz
-	dtd2 := makeDTD(height, width, 60, 150, 200)
+	dtd2 := makeDTD(height, width, 60, hMM, wMM)
 	copy(edid[72:90], dtd2)
 
-	// Descriptor 3: Monitor Range Limits (48-75 Hz vertical, 30-120 kHz horizontal, max 200 MHz clock)
+	// Descriptor 3: Monitor Range Limits (48-120 Hz vertical, 30-250 kHz horizontal, max 600 MHz clock)
 	copy(edid[90:108], []byte{
 		0x00, 0x00, 0x00, 0xfd, 0x00,
-		48, 75, 30, 120, 20,
+		48, 120, 30, 250, 60,
 		0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
 	})
 

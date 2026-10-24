@@ -24,10 +24,17 @@ var (
 	version = "0.2.0"
 )
 
-func parseResolution(res string) (int, int, error) {
-	parts := strings.Split(strings.ToLower(strings.TrimSpace(res)), "x")
+func resolveResolution(res string) (int, int, error) {
+	trimmed := strings.ToLower(strings.TrimSpace(res))
+	if trimmed == "" || trimmed == "auto" {
+		if w, h, ok := adb.DetectTabletResolution(); ok {
+			return w, h, nil
+		}
+		return 1600, 1200, nil
+	}
+	parts := strings.Split(trimmed, "x")
 	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("invalid resolution %q (expected WIDTHxHEIGHT, e.g. 1600x1200)", res)
+		return 0, 0, fmt.Errorf("invalid resolution %q (expected auto or WIDTHxHEIGHT, e.g. 1600x1200)", res)
 	}
 	w, err1 := strconv.Atoi(parts[0])
 	h, err2 := strconv.Atoi(parts[1])
@@ -44,7 +51,7 @@ func main() {
 	qp := flag.Int("qp", 26, "VA-API Quantization Parameter (lower = higher quality, higher = lower bitrate, default 26)")
 	cursorMode := flag.Uint("cursor", uint(portal.CursorModeEmbedded), "Cursor mode (1: hidden, 2: embedded)")
 	virtual := flag.Bool("virtual", true, "Create a dedicated virtual display at native tablet resolution (use -virtual=false to mirror existing display)")
-	res := flag.String("res", "1600x1200", "Virtual display resolution (1600x1200 landscape or 1200x1600 portrait)")
+	res := flag.String("res", "auto", "Virtual display resolution (auto, or WIDTHxHEIGHT e.g. 1600x1200, 1200x1600)")
 	scale := flag.Float64("scale", 1.25, "Pixel scale factor for virtual display (e.g. 1.25 or 1.5 for larger fonts)")
 	output := flag.String("output", "", "Specific display output to capture (e.g. eDP-1, DP-2, HDMI-A-1)")
 	mirrorOn := flag.String("mirror-on", "", "Mirror the virtual display onto a physical output (e.g. eDP-1)")
@@ -69,7 +76,7 @@ func main() {
 	targetOut := strings.TrimSpace(*output)
 
 	if *virtual {
-		w, h, err := parseResolution(*res)
+		w, h, err := resolveResolution(*res)
 		if err != nil {
 			log.Fatalf("[vdisplay] %v", err)
 		}
