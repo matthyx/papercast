@@ -29,6 +29,7 @@ type Server struct {
 	addr       string
 	httpServer *http.Server
 	clients    map[*client]struct{}
+	currentGOP [][]byte
 	mu         sync.RWMutex
 }
 
@@ -72,6 +73,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) BroadcastFrame(frame []byte, isKey bool) {
+	s.mu.Lock()
+	if isKey {
+		s.currentGOP = append(s.currentGOP[:0], frame)
+	} else if len(s.currentGOP) > 0 && len(s.currentGOP) < 35 {
+		s.currentGOP = append(s.currentGOP, frame)
+	}
+	s.mu.Unlock()
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -128,10 +137,18 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	c := &client{
 		ws: ws,
-		ch: make(chan []byte, 30), // 30-frame buffer (absorbs YouTube spikes with zero drops)
+		ch: make(chan []byte, 40), // 40-frame buffer (holds full 30-frame GOP)
 	}
 
 	s.mu.Lock()
+	if len(s.currentGOP) > 0 {
+		c.ch <- s.currentGOP[0]
+		if len(s.currentGOP) > 1 {
+			c.droppingGOP = true
+		}
+	} else {
+		c.droppingGOP = true
+	}
 	s.clients[c] = struct{}{}
 	clientCount := len(s.clients)
 	s.mu.Unlock()
@@ -149,11 +166,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Reader loop (monitors disconnection and reads input events)
+	// Reader loop (monitors disconnection and reads client telemetry)
 	for {
-		_, _, err := ws.ReadMessage()
+		mt, msg, err := ws.ReadMessage()
 		if err != nil {
 			break
+		}
+		if mt == websocket.TextMessage && len(msg) > 0 {
+			log.Printf("[client] %s", string(msg))
 		}
 	}
 

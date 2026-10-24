@@ -110,6 +110,7 @@
     <div id="container">
         <canvas id="view"></canvas>
         <div id="hud">
+            <button class="btn" id="btn-decoder">Decoder: Auto</button>
             <button class="btn" id="btn-contrast">Contrast</button>
             <button class="btn" id="btn-fs">Fullscreen</button>
         </div>
@@ -124,6 +125,7 @@
         const statusEl = document.getElementById("status-msg");
         const btnFs = document.getElementById("btn-fs");
         const btnContrast = document.getElementById("btn-contrast");
+        const btnDecoder = document.getElementById("btn-decoder");
 
         let decoder = null;
         let ws = null;
@@ -133,6 +135,21 @@
         let hasReceivedKeyframe = false;
         let contrastModes = ["normal", "high-contrast", "grayscale"];
         let currentContrast = 0;
+
+        let hwAccelMode = "prefer-hardware"; // "prefer-hardware" or "prefer-software"
+        let autoFallbackDone = false;
+        let sentCount = 0;
+        let outputCount = 0;
+        let lastDecodeMs = 0;
+        let currentGopBuffers = [];
+
+        btnDecoder.onclick = (e) => {
+            e.stopPropagation();
+            hwAccelMode = (hwAccelMode === "prefer-hardware") ? "prefer-software" : "prefer-hardware";
+            autoFallbackDone = true;
+            btnDecoder.textContent = (hwAccelMode === "prefer-software") ? "Decoder: SW" : "Decoder: HW";
+            switchDecoderMode(hwAccelMode, "manual toggle");
+        };
 
         btnContrast.onclick = (e) => {
             e.stopPropagation();
@@ -166,8 +183,9 @@
         });
 
         function isKeyframe(data) {
-            // Scan for NAL units in Annex B byte stream
-            for (let i = 0; i < data.length - 4; i++) {
+            // Scan header region for SPS (7) or IDR (5) NAL units in Annex B byte stream
+            const limit = Math.min(data.length - 4, 128);
+            for (let i = 0; i < limit; i++) {
                 if (data[i] === 0 && data[i+1] === 0 && (data[i+2] === 1 || (data[i+2] === 0 && data[i+3] === 1))) {
                     let nalOffset = (data[i+2] === 1) ? i + 3 : i + 4;
                     let nalType = data[nalOffset] & 0x1f;
@@ -178,20 +196,55 @@
             return false;
         }
 
-        const decoderConfig = {
-            codec: "avc1.42E028", // Constrained Baseline Profile, Level 4.0
-            avc: { format: "annexb" },
-            optimizeForLatency: true,
-            hardwareAcceleration: "prefer-hardware"
-        };
+        function getDecoderConfig() {
+            return {
+                codec: "avc1.42E028", // Constrained Baseline Profile, Level 4.0
+                avc: { format: "annexb" },
+                optimizeForLatency: true,
+                hardwareAcceleration: hwAccelMode
+            };
+        }
+
+        function switchDecoderMode(newMode, reason) {
+            hwAccelMode = newMode;
+            btnDecoder.textContent = (hwAccelMode === "prefer-software") ? "Decoder: SW" : "Decoder: HW";
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(`Switched decoder to ${hwAccelMode} (${reason})`);
+            }
+            configureDecoder();
+            if (currentGopBuffers.length > 0 && decoder && decoder.state === "configured") {
+                for (let i = 0; i < currentGopBuffers.length; i++) {
+                    const item = currentGopBuffers[i];
+                    try {
+                        sentCount++;
+                        decoder.decode(new EncodedVideoChunk({
+                            type: item.isKey ? "key" : "delta",
+                            timestamp: Math.round(performance.now() * 1000),
+                            data: item.data
+                        }));
+                    } catch (e) {
+                        break;
+                    }
+                }
+                hasReceivedKeyframe = true;
+            } else {
+                hasReceivedKeyframe = false;
+            }
+        }
 
         function configureDecoder() {
             if (decoder) {
                 try { decoder.close(); } catch(e) {}
             }
+            sentCount = 0;
+            outputCount = 0;
             try {
                 decoder = new VideoDecoder({
                     output: (frame) => {
+                        outputCount++;
+                        const nowUs = performance.now() * 1000;
+                        lastDecodeMs = Math.max(0, (nowUs - frame.timestamp) / 1000);
+
                         try {
                             if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
                                 canvas.width = frame.displayWidth;
@@ -204,11 +257,21 @@
                             frame.close();
                         }
 
+                        if (outputCount === 1 && ws && ws.readyState === WebSocket.OPEN) {
+                            const modeTag = (hwAccelMode === "prefer-software") ? "SW" : "HW";
+                            ws.send(`first-frame: ${canvas.width}x${canvas.height} | decode=${lastDecodeMs.toFixed(1)}ms | mode=${modeTag}`);
+                        }
+
                         frameCount++;
                         let now = performance.now();
                         if (now - lastFpsTime >= 1000) {
                             fps = Math.round((frameCount * 1000) / (now - lastFpsTime));
-                            statsEl.textContent = `FPS: ${fps} | ${canvas.width}x${canvas.height} | WebCodecs HW`;
+                            const modeTag = (hwAccelMode === "prefer-software") ? "SW" : "HW";
+                            const inFlight = Math.max(0, sentCount - outputCount);
+                            statsEl.textContent = `FPS: ${fps} | ${canvas.width}x${canvas.height} | ${lastDecodeMs.toFixed(0)}ms (${modeTag})`;
+                            if (ws && ws.readyState === WebSocket.OPEN) {
+                                ws.send(`stats: ${canvas.width}x${canvas.height} | ${fps} FPS | decode=${lastDecodeMs.toFixed(1)}ms | inFlight=${inFlight} | queue=${decoder.decodeQueueSize} | mode=${modeTag}`);
+                            }
                             frameCount = 0;
                             lastFpsTime = now;
                         }
@@ -218,16 +281,26 @@
                     },
                     error: (e) => {
                         console.error("VideoDecoder error:", e);
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(`decoder-error: ${e.message || e}`);
+                        }
+                        if (hwAccelMode === "prefer-hardware" && !autoFallbackDone) {
+                            autoFallbackDone = true;
+                            switchDecoderMode("prefer-software", "hardware decoder error");
+                            return;
+                        }
                         hasReceivedKeyframe = false;
                         try {
                             decoder.reset();
-                            decoder.configure(decoderConfig);
+                            decoder.configure(getDecoderConfig());
+                            sentCount = 0;
+                            outputCount = 0;
                         } catch(resetErr) {
                             configureDecoder();
                         }
                     }
                 });
-                decoder.configure(decoderConfig);
+                decoder.configure(getDecoderConfig());
                 return true;
             } catch (err) {
                 console.error("Decoder configuration failed:", err);
@@ -278,6 +351,12 @@
                 const u8 = new Uint8Array(event.data);
                 const isKey = isKeyframe(u8);
 
+                if (isKey) {
+                    currentGopBuffers = [{ data: u8, isKey: true }];
+                } else if (currentGopBuffers.length > 0 && currentGopBuffers.length < 35) {
+                    currentGopBuffers.push({ data: u8, isKey: false });
+                }
+
                 // If waiting for keyframe and this is not a keyframe, drop it
                 if (!hasReceivedKeyframe && !isKey) {
                     return;
@@ -292,8 +371,17 @@
                     }
                 }
 
-                // Drop delta frames if hardware decoder queue backs up
-                if (decoder.decodeQueueSize > 8 && !isKey) {
+                // Auto-detect hardware decoders (e.g. MediaTek c2.mtk.avc.decoder) that buffer
+                // multiple frames in an internal DPB reorder queue without low-latency support.
+                const inFlight = sentCount - outputCount;
+                if (hwAccelMode === "prefer-hardware" && !autoFallbackDone && (inFlight >= 3 || (outputCount >= 5 && lastDecodeMs > 65))) {
+                    autoFallbackDone = true;
+                    switchDecoderMode("prefer-software", `hardware decoder buffered ${inFlight} frames (${lastDecodeMs.toFixed(0)}ms)`);
+                    return;
+                }
+
+                // Drop delta frames if decoder queue backs up (>4 frames) to prevent pointer lag
+                if (decoder.decodeQueueSize > 4 && !isKey) {
                     hasReceivedKeyframe = false;
                     return;
                 }
@@ -301,19 +389,33 @@
                 try {
                     const chunk = new EncodedVideoChunk({
                         type: isKey ? "key" : "delta",
-                        timestamp: performance.now() * 1000,
+                        timestamp: Math.round(performance.now() * 1000),
                         data: u8
                     });
+                    sentCount++;
+                    const checkSeq = sentCount;
                     decoder.decode(chunk);
                     if (isKey) {
                         hasReceivedKeyframe = true;
+                    }
+                    // If hardware decoder holds a frame for >65ms without emitting output(frame)
+                    // (waiting for subsequent frames to fill its DPB), switch to zero-buffer software decoder.
+                    if (hwAccelMode === "prefer-hardware" && !autoFallbackDone) {
+                        setTimeout(() => {
+                            if (hwAccelMode === "prefer-hardware" && !autoFallbackDone && outputCount < checkSeq) {
+                                autoFallbackDone = true;
+                                switchDecoderMode("prefer-software", `hardware decoder held frame #${checkSeq} >65ms waiting for future frames`);
+                            }
+                        }, 65);
                     }
                 } catch (err) {
                     console.warn("Decode chunk error:", err);
                     hasReceivedKeyframe = false;
                     try {
                         decoder.reset();
-                        decoder.configure(decoderConfig);
+                        decoder.configure(getDecoderConfig());
+                        sentCount = 0;
+                        outputCount = 0;
                     } catch(resetErr) {
                         configureDecoder();
                     }

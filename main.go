@@ -66,6 +66,10 @@ func main() {
 
 	log.Printf("==> Papercast v%s: Ultra-low latency desktop streamer", version)
 
+	// Register signal handler early so SIGINT/SIGTERM during startup still cleans up virtual displays
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
 	// 1. Setup ADB reverse port forwarding for USB connection
 	if err := adb.SetupReverseForwarding(*port); err != nil {
 		log.Printf("[adb] Warning: %v", err)
@@ -172,8 +176,6 @@ func main() {
 	}
 
 	// Wait for termination signal
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 
 	log.Printf("\n[papercast] Shutting down...")

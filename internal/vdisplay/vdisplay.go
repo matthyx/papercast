@@ -169,7 +169,17 @@ func makeDTD(hActive, vActive, refreshHz, wMM, hMM int) []byte {
 	return b
 }
 
-// findUnusedConnector locates a disconnected DRM connector on the primary GPU card.
+// isPapercastEDID checks whether a connector's active EDID has our "HSP" manufacturer ID (0x22, 0x70).
+func isPapercastEDID(connDir string) bool {
+	edidBytes, err := os.ReadFile(filepath.Join(connDir, "edid"))
+	if err != nil || len(edidBytes) < 10 {
+		return false
+	}
+	return edidBytes[8] == 0x22 && edidBytes[9] == 0x70
+}
+
+// findUnusedConnector locates a disconnected DRM connector on the primary GPU card,
+// cleaning up any stale virtual connectors left behind by a previously killed process.
 func findUnusedConnector(preferred string) (cardIdx string, connector string, err error) {
 	matches, err := filepath.Glob("/sys/class/drm/card*-*")
 	if err != nil || len(matches) == 0 {
@@ -195,6 +205,17 @@ func findUnusedConnector(preferred string) (cardIdx string, connector string, er
 			continue
 		}
 		status := strings.TrimSpace(string(statusBytes))
+
+		// If a connector is still marked connected with a synthetic Papercast EDID
+		// from an unclean exit (e.g. kill -9), reset it first so it can be reused cleanly.
+		if status == "connected" && isPapercastEDID(m) {
+			sysStatusPath := filepath.Join(m, "status")
+			debugForcePath := fmt.Sprintf("/sys/kernel/debug/dri/%s/%s/force", cIdx, cName)
+			script := fmt.Sprintf("echo off > %q; echo detect > %q; echo unspecified > %q 2>/dev/null || true",
+				sysStatusPath, sysStatusPath, debugForcePath)
+			_ = exec.Command("sudo", "-n", "sh", "-c", script).Run()
+			status = "disconnected"
+		}
 
 		if preferred != "" && cName == preferred {
 			return cIdx, cName, nil

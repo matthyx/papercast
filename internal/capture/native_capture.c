@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <string.h>
+#include <time.h>
 
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
@@ -49,6 +50,7 @@ struct native_capture {
     int enc_width;
     int enc_height;
     int64_t frame_index;
+    int64_t last_encode_ns;
 };
 
 static void cleanup_encoder(struct native_capture *cap) {
@@ -80,8 +82,10 @@ static int init_encoder(struct native_capture *cap, int width, int height, enum 
     cap->enc_width = width;
     cap->enc_height = height;
     cap->frame_index = 0;
+    cap->last_encode_ns = 0;
 
     int fps = cap->fps > 0 ? cap->fps : 30;
+    int gop = fps / 2 >= 10 ? fps / 2 : 15;
     int qp = cap->qp > 0 ? cap->qp : 26;
 
     // 1. Try VA-API hardware encoder first
@@ -95,7 +99,7 @@ static int init_encoder(struct native_capture *cap, int width, int height, enum 
             cap->enc_ctx->time_base = (AVRational){1, fps};
             cap->enc_ctx->framerate = (AVRational){fps, 1};
             cap->enc_ctx->pix_fmt = AV_PIX_FMT_VAAPI;
-            cap->enc_ctx->gop_size = fps;
+            cap->enc_ctx->gop_size = gop;
             cap->enc_ctx->max_b_frames = 0;
             cap->enc_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
             cap->enc_ctx->profile = AV_PROFILE_H264_CONSTRAINED_BASELINE;
@@ -204,6 +208,18 @@ static void on_process(void *userdata) {
     uint8_t *src_data = buf->datas[0].data;
 
     if (src_data != NULL && cap->enc_ctx != NULL && cap->sws != NULL && cap->sw_frame != NULL) {
+        if (cap->fps > 0 && cap->fps < 30) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            int64_t now_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+            int64_t min_interval_ns = (1000000000LL / cap->fps) - 2000000LL;
+            if (cap->last_encode_ns > 0 && (now_ns - cap->last_encode_ns) < min_interval_ns) {
+                pw_stream_queue_buffer(cap->stream, b);
+                return;
+            }
+            cap->last_encode_ns = now_ns;
+        }
+
         uint8_t *src_slices[1] = { src_data };
         int src_stride = buf->datas[0].chunk->stride;
         if (src_stride <= 0) {
@@ -409,13 +425,14 @@ int native_capture_start(native_capture_t *cap) {
     spa_pod_builder_id(&b, SPA_VIDEO_FORMAT_NV12);
     spa_pod_builder_pop(&b, &f[1]);
 
+    int target_fps = cap->fps > 0 ? cap->fps : 30;
     spa_pod_builder_add(&b,
         SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(
             &SPA_RECTANGLE(1920, 1080),
             &SPA_RECTANGLE(1, 1),
             &SPA_RECTANGLE(7680, 4320)),
         SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-            &SPA_FRACTION(cap->fps > 0 ? cap->fps : 30, 1),
+            &SPA_FRACTION(target_fps, 1),
             &SPA_FRACTION(1, 1),
             &SPA_FRACTION(60, 1)),
         0);
