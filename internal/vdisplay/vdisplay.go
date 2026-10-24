@@ -51,12 +51,14 @@ func BuildEDID(width, height int) []byte {
 	edid[8] = byte(mfg >> 8)
 	edid[9] = byte(mfg & 0xff)
 
-	// Product code: 0x1701 (little-endian)
-	edid[10] = 0x01
-	edid[11] = 0x17
-
-	// Serial number: 1
-	edid[12] = 0x01
+	// Product code & serial number derived from resolution so the compositor
+	// treats each tablet resolution as a distinct monitor profile.
+	edid[10] = byte(width & 0xff)
+	edid[11] = byte((width >> 8) & 0xff)
+	edid[12] = byte(height & 0xff)
+	edid[13] = byte((height >> 8) & 0xff)
+	edid[14] = byte(width & 0xff)
+	edid[15] = byte((width >> 8) & 0xff)
 
 	// Week 1, Year 2024 (2024 - 1990 = 34)
 	edid[16] = 1
@@ -87,12 +89,9 @@ func BuildEDID(width, height int) []byte {
 	// Standard sRGB chromaticity coordinates
 	copy(edid[25:35], []byte{0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54})
 
-	// Established timings (1024x768@60, 800x600@60, 640x480@60)
-	copy(edid[35:38], []byte{0x21, 0x08, 0x00})
-
-	// Standard timings: 1600x1200@60, 1440x1080@60, 1280x960@60
-	copy(edid[38:44], []byte{0xa9, 0x40, 0x95, 0x40, 0x81, 0x40})
-	for i := 44; i < 54; i++ {
+	// No legacy established/standard timings so only the tablet's exact DTD modes are advertised
+	copy(edid[35:38], []byte{0x00, 0x00, 0x00})
+	for i := 38; i < 54; i++ {
 		edid[i] = 0x01
 	}
 
@@ -111,11 +110,15 @@ func BuildEDID(width, height int) []byte {
 		0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
 	})
 
-	// Descriptor 4: Monitor Name ("HannsNote2")
-	copy(edid[108:126], []byte{
-		0x00, 0x00, 0x00, 0xfc, 0x00,
-		'H', 'a', 'n', 'n', 's', 'N', 'o', 't', 'e', '2', '\n', ' ', ' ',
-	})
+	// Descriptor 4: Monitor Name ("PC-WIDTHxHEIGHT")
+	name := fmt.Sprintf("PC-%dx%d\n", width, height)
+	if len(name) > 13 {
+		name = name[:13]
+	}
+	nameBytes := []byte("             ")
+	copy(nameBytes, []byte(name))
+	copy(edid[108:113], []byte{0x00, 0x00, 0x00, 0xfc, 0x00})
+	copy(edid[113:126], nameBytes)
 
 	// Checksum
 	var sum uint8
@@ -128,22 +131,21 @@ func BuildEDID(width, height int) []byte {
 }
 
 func makeDTD(hActive, vActive, refreshHz, wMM, hMM int) []byte {
-	hBlank := 400
-	hSyncOffset := 48
-	hSyncWidth := 112
-	if hActive == 1600 && vActive == 1200 {
-		// Exact VESA UXGA 1600x1200 @ 60Hz timing
-		hBlank = 560
-		hSyncOffset = 64
-		hSyncWidth = 192
-	}
-	vBlank := 50
-	vSyncOffset := 1
-	vSyncWidth := 3
+	// CVT-RB2 reduced blanking keeps pixel clock below the 165.0 MHz single-link
+	// HDMI/DVI limit enforced by intel_hdmi_mode_clock_valid on 128-byte EDIDs.
+	hBlank := 80
+	hSyncOffset := 24
+	hSyncWidth := 32
+	vBlank := 20
+	vSyncOffset := 3
+	vSyncWidth := 6
 
 	totalH := hActive + hBlank
 	totalV := vActive + vBlank
 	pclk10kHz := (totalH * totalV * refreshHz) / 10000
+	if pclk10kHz > 16450 {
+		pclk10kHz = 16450
+	}
 
 	b := make([]byte, 18)
 	b[0] = byte(pclk10kHz & 0xff)
