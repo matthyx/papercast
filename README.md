@@ -15,7 +15,8 @@ Existing desktop streamers (like Weylus or Deskreen) suffer from severe input la
 * **Hardware-Accelerated Virtual Display (Auto-Resolution)**: Automatically detects the connected Android tablet's native resolution via `adb shell wm size` (falling back to `1600x1200`) and provisions a dedicated virtual display on an unused Intel DRM/KMS connector with a custom EDID and independent HiDPI scaling (`-scale 1.25` or `1.5`), filling 100% of the tablet screen with crisp, readable fonts and zero black bars. Automatically disconnects on exit.
 * **Headless ScreenCast via Persistent Restore Tokens**: Pre-seeds the XDG `PermissionStore` and permanently saves restore tokens (`~/.config/papercast/restore_token*`). Launches **100% headlessly with zero screen-picker prompts**.
 * **Self-Healing Supervisor Loop**: Pop!_OS COSMIC and other Wayland compositors often reset screencast nodes during fullscreen toggling (e.g. YouTube fullscreen) or mode switches. Papercast's supervisor detects node detaches via PipeWire registry events and revives the session headlessly in **<100ms** without freezing the tablet.
-* **Synchronous Atomic WebCodecs Decoder**: Android's `MediaCodec` pipeline crashes when fed delta frames while an async decoder configuration is in flight. Papercast's client uses synchronous decoder resets and keyframe-gated decoding, ensuring glitch-free playback through dynamic resolution switches.
+* **Adaptive HW/SW Zero-Buffer WebCodecs Decoder**: Automatically measures real-time decode latency and in-flight frame buffering. Zero-latency hardware decoders (such as the Rockchip RK3566 VPU on the HannsNote2) run in hardware (`HW`), while SoCs whose `MediaCodec` firmware buffers multiple frames in a DPB reorder queue (such as MediaTek `c2.mtk.avc.decoder`) automatically switch to Chromium's zero-buffer ARM64 NEON decoder (`SW`) to eliminate pointer lag.
+* **Instant Keyframe Caching & 0.5s GOP**: Caches the latest IDR keyframe in the WebSocket broadcaster so newly connected or refreshed tablets render the desktop immediately—even when the screen is completely stationary.
 * **Immediate PipeWire Buffer Recycling**: Returns buffers to the compositor in <1ms immediately after scaling, preventing compositor frame drops and upstream portal buffer starvation.
 * **Single Port & ADB Integration**: Automatically provisions `adb reverse tcp:1701 tcp:1701`. Both HTTP assets and the real-time WebSocket operate over port `1701`.
 * **High-Contrast Outdoor Modes**: Instant one-tap toggles for high-contrast and grayscale rendering tailored for reading in direct sunlight on reflective LCDs (RLCD) and e-ink displays.
@@ -62,6 +63,7 @@ http://127.0.0.1:1701
 ```
 * Tap **Fullscreen** to enter immersive mode without browser chrome.
 * Tap **Contrast** to cycle between Normal, High-Contrast, and Grayscale modes for outdoor reading.
+* Tap **Decoder: HW / SW** to manually toggle between hardware and software WebCodecs decoding if desired.
 
 ---
 
@@ -101,27 +103,27 @@ Usage of papercast:
 
 ```
 [ Laptop: COSMIC Wayland Desktop ]
+   ├── DRM/KMS Virtual Display (CVT-RB2 EDID + cosmic-randr HiDPI Scale)
+   └── xdg-desktop-portal ScreenCast (Headless PermissionStore + Restore Token)
         │
-   (xdg-desktop-portal ScreenCast / Headless Restore Token)
-        │
-   (Native libpipewire-0.3 Thread Loop)
+   (Native libpipewire-0.3 Thread Loop — Double-Buffered)
         │
    (libswscale Fast NV12 Conversion & Immediate Buffer Return)
         │
-[ Intel VA-API Hardware H.264 Encoder (libavcodec) ]
+[ Intel VA-API Hardware H.264 Encoder (libavcodec, 0.5s GOP) ]
         │
    (Raw H.264 Annex-B NAL Units via Cgo)
         │
 [ Papercast Go Server (Port 1701) ]
    ├── Embedded Web App (//go:embed)
-   ├── Self-Healing Supervisor & Frame Watchdog
-   └── GOP-Aware Non-Blocking WebSocket Broadcaster
+   ├── Self-Healing Supervisor Loop
+   └── Instant-Keyframe & GOP-Aware WebSocket Broadcaster
         │
-   (USB Link via ADB Reverse)
+   (USB Link via ADB Reverse + Auto-Resolution via `adb shell wm size`)
         │
-[ Tablet: HannsNote2 Chrome Browser ]
-   ├── Synchronous WebCodecs VideoDecoder (avc1.42E028)
-   └── Zero-Latency <canvas> Display + Hardware Contrast Filters
+[ Tablet: Android Chrome Browser ]
+   ├── Adaptive HW/SW WebCodecs VideoDecoder (Zero-Buffer Auto-Fallback)
+   └── Zero-Latency <canvas> Display + Outdoor Contrast Filters
 ```
 
 ---
